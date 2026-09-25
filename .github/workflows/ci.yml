@@ -3,6 +3,10 @@
 # commit's own seed; the tests then run on Linux and macOS (nxtls reads
 # /dev/urandom, which Windows lacks until it moves to random.secure), the
 # sources are checked for formatting, and the example bot is checked.
+#
+# The package and Nexium are checked out side by side: inside the
+# package's directory, the compiler's build would find the package's
+# nexium.toml above it and ask for its dependencies.
 
 name: CI
 
@@ -35,6 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          path: pkg
           persist-credentials: false
 
       - name: Check out Nexium at the pinned commit
@@ -42,7 +47,7 @@ jobs:
         with:
           repository: Londopy/nexium
           ref: ${{ env.NEXIUM_COMMIT }}
-          path: .nexium
+          path: nexium
           persist-credentials: false
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -50,23 +55,26 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Build nx from the seed
-        working-directory: .nexium
+        working-directory: nexium
         run: sh bootstrap/build.sh
 
       - name: Fetch the dependencies
-        run: .nexium/nx-out/bootstrap/nx2 fetch
+        working-directory: pkg
+        run: "$GITHUB_WORKSPACE/nexium/nx-out/bootstrap/nx2 fetch"
 
       - name: Tests
+        working-directory: pkg
         run: |
           for m in js gateway message interaction command event lib; do
-            .nexium/nx-out/bootstrap/nx2 test src/$m.nx --out-dir nx-out/t-$m
+            "$GITHUB_WORKSPACE/nexium/nx-out/bootstrap/nx2" test src/$m.nx --out-dir nx-out/t-$m
           done
 
       - name: Formatting
-        run: .nexium/nx-out/bootstrap/nx2 fmt src/*.nx examples/pingbot/main.nx --check
+        working-directory: pkg
+        run: "$GITHUB_WORKSPACE/nexium/nx-out/bootstrap/nx2 fmt src/*.nx examples/pingbot/main.nx --check"
 
       - name: The example bot checks
-        working-directory: examples/pingbot
+        working-directory: pkg/examples/pingbot
         run: |
-          ../../.nexium/nx-out/bootstrap/nx2 fetch
-          ../../.nexium/nx-out/bootstrap/nx2 check main.nx
+          "$GITHUB_WORKSPACE/nexium/nx-out/bootstrap/nx2" fetch
+          "$GITHUB_WORKSPACE/nexium/nx-out/bootstrap/nx2" check main.nx
