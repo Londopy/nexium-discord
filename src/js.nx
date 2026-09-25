@@ -1,0 +1,98 @@
+// js.nx: shorthands over std.json for reading Discord's payloads and for
+// building what is sent back.
+
+import std.json
+
+/// A string member, or "" when it is absent or not a string.
+pub fn str(v: *json.Json, key: []u8) -> []u8 {
+    let f = json.get(v, key) orelse return ""
+    return json.as_str(f) orelse ""
+}
+
+/// A number member as an integer, or `fallback`.
+pub fn int(v: *json.Json, key: []u8, fallback: i64) -> i64 {
+    let f = json.get(v, key) orelse return fallback
+    let n = json.as_num(f) orelse return fallback
+    return n as i64
+}
+
+pub fn flag(v: *json.Json, key: []u8) -> bool {
+    let f = json.get(v, key) orelse return false
+    return json.as_bool(f) orelse false
+}
+
+/// A member's value as text whatever its type: strings as they are,
+/// numbers as integers, booleans as true or false.
+pub fn text(v: *json.Json) -> String {
+    if let s = json.as_str(v) {
+        return String.from(s)
+    }
+    if let n = json.as_num(v) {
+        return format("{}", .{n as i64})
+    }
+    if let b = json.as_bool(v) {
+        return String.from(if b { "true" } else { "false" })
+    }
+    return String.new()
+}
+
+/// An array of strings, as owned strings; empty when absent.
+pub fn strings(v: *json.Json, key: []u8) -> List(String) {
+    var out = List(String).new()
+    let arr = json.get(v, key) orelse return out
+    for i in 0..json.len(arr) {
+        if let item = json.at(arr, i) {
+            out.append(text(item))
+        }
+    }
+    return out
+}
+
+pub fn obj() -> json.Json {
+    return json.object()
+}
+
+pub fn put_str(o: *mut json.Json, key: []u8, value: []u8) {
+    json.set(o, key, json.string(value))
+}
+
+pub fn put_int(o: *mut json.Json, key: []u8, value: i64) {
+    json.set(o, key, json.number(value as f64))
+}
+
+pub fn put_bool(o: *mut json.Json, key: []u8, value: bool) {
+    json.set(o, key, json.boolean(value))
+}
+
+pub fn put(o: *mut json.Json, key: []u8, own value: json.Json) {
+    json.set(o, key, value)
+}
+
+pub fn string_array(items: []String) -> json.Json {
+    var a = json.array()
+    for s in items {
+        json.push(&mut a, json.string(s))
+    }
+    return a
+}
+
+test "reading members of any type, with fallbacks" {
+    let v = json.parse("{\"a\":\"x\",\"n\":64,\"b\":true,\"l\":[\"p\",2],\"id\":\"1552152388045906071\"}") catch {
+        panic("parse")
+    }
+    expect_eq(str(&v, "a"), "x")
+    expect_eq(str(&v, "n"), "")
+    expect_eq(str(&v, "missing"), "")
+    expect_eq(int(&v, "n", 0), 64)
+    expect_eq(int(&v, "a", -1), -1)
+    expect(flag(&v, "b"))
+    let l = strings(&v, "l")
+    expect_eq(l.len, 2)
+    expect_eq(l[1], "2")
+    expect_eq(str(&v, "id"), "1552152388045906071")
+    var o = obj()
+    put_int(&mut o, "flags", 64)
+    put_str(&mut o, "content", "hi \"there\"")
+    put_bool(&mut o, "tts", false)
+    expect_eq(json.stringify(&o), "{\"flags\":64,\"content\":\"hi \\\"there\\\"\",\"tts\":false}")
+}

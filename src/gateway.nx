@@ -1,0 +1,470 @@
+// gateway.nx: Discord's Gateway protocol (v10, JSON, no compression), as a
+// state machine with no socket in it.
+//
+// The loop that owns the WebSocket (`Bot.next` in discord) hands this every
+// message that arrives, and asks it on every pass whether a heartbeat is
+// due. In return it gets a Step: payloads to send, events for the bot, and
+// whether to close the connection. Time is always passed in, so the tests
+// drive a whole session with made-up clocks and messages.
+//
+// The protocol, briefly: the server says Hello with a heartbeat interval;
+// the bot identifies (or resumes a session it already has), then
+// heartbeats on that interval, the first one after a random part of it.
+// Every dispatch carries a sequence number, sent back with each heartbeat
+// and a resume. A heartbeat not acknowledged before the next is due means
+// the connection is dead though still open ("zombied"): close it and
+// resume. Reconnect (op 7) and Invalid Session (op 9) ask for a new
+// connection; close codes say whether resuming is still possible or the
+// configuration is wrong (a bad token, intents the application may not
+// use), which no retry fixes.
+//
+// Intents are fixed for a session: asking for others means identifying
+// anew, so set_intents forgets the session.
+//
+// Every Identify and Resume carries the bot token: whoever sends a Step's
+// payloads must never log them.
+//
+// Lifted from a Discord bot that has run on it since September 2026.
+
+import std.json
+import js
+
+/// Gateway intents (Discord's "List of Intents"): what the bot is told
+/// about. Or them together.
+pub const GUILDS: u64 = 1
+pub const GUILD_MEMBERS: u64 = 2
+pub const GUILD_MODERATION: u64 = 4
+pub const GUILD_EXPRESSIONS: u64 = 8
+pub const GUILD_INTEGRATIONS: u64 = 16
+pub const GUILD_WEBHOOKS: u64 = 32
+pub const GUILD_INVITES: u64 = 64
+pub const GUILD_VOICE_STATES: u64 = 128
+pub const GUILD_PRESENCES: u64 = 256
+pub const GUILD_MESSAGES: u64 = 512
+pub const GUILD_MESSAGE_REACTIONS: u64 = 1024
+pub const GUILD_MESSAGE_TYPING: u64 = 2048
+pub const DIRECT_MESSAGES: u64 = 4096
+pub const DIRECT_MESSAGE_REACTIONS: u64 = 8192
+pub const DIRECT_MESSAGE_TYPING: u64 = 16384
+pub const MESSAGE_CONTENT: u64 = 32768
+pub const GUILD_SCHEDULED_EVENTS: u64 = 65536
+pub const AUTO_MODERATION_CONFIGURATION: u64 = 1048576
+pub const AUTO_MODERATION_EXECUTION: u64 = 2097152
+pub const GUILD_MESSAGE_POLLS: u64 = 16777216
+pub const DIRECT_MESSAGE_POLLS: u64 = 33554432
+
+/// The intents the Developer Portal must allow (Bot tab, "Privileged
+/// Gateway Intents").
+pub const PRIVILEGED: u64 = GUILD_MEMBERS | GUILD_PRESENCES | MESSAGE_CONTENT
+
+// opcodes
+const DISPATCH: i64 = 0
+const HEARTBEAT: i64 = 1
+const IDENTIFY: i64 = 2
+const RESUME: i64 = 6
+const RECONNECT: i64 = 7
+const INVALID_SESSION: i64 = 9
+const HELLO: i64 = 10
+const HEARTBEAT_ACK: i64 = 11
+
+/// The close code the bot uses when it means to resume; 1000 and 1001
+/// would end the session.
+pub const RESUME_CLOSE: u16 = 4900
+
+/// Where a new session connects.
+pub const DEFAULT_URL: []u8 = "wss://gateway.discord.gg/?v=10&encoding=json"
+
+/// One dispatch: its event name (`t`) and the whole payload as it came.
+pub struct Dispatch {
+    name: String
+    raw: String
+}
+
+/// What to do after a message or a tick.
+pub struct Step {
+    /// Gateway payloads to send, in order (they may hold the token)
+    send: List(String)
+    dispatches: List(Dispatch)
+    /// non-zero: close the connection with this code, then reconnect
+    close: u16
+}
+
+fn step() -> Step {
+    return Step{ .send = List(String).new(), .dispatches = List(Dispatch).new(), .close = 0 }
+}
+
+pub struct Gateway {
+    token: String
+    intents: u64
+    /// a Hello came on this connection, so heartbeats are running
+    hello: bool
+    /// READY or RESUMED came on this connection
+    ready: bool
+    seq: i64
+    session_id: String
+    /// where READY said to resume (`resume_gateway_url`)
+    resume_url: String
+    user_id: String
+    application_id: String
+    interval: i64
+    next_beat: i64
+    awaiting_ack: bool
+    /// set when no retry can help (a bad token, intents not allowed)
+    fatal: String
+    failures: u32
+    /// when to connect again after a connection ended
+    next_connect: i64
+}
+
+impl Gateway {
+    pub fn new(token: []u8, intents: u64) -> Gateway {
+        return Gateway{ .token = String.from(token), .intents = intents, .hello = false, .ready = false, .seq = -1, .session_id = String.new(), .resume_url = String.new(), .user_id = String.new(), .application_id = String.new(), .interval = 0, .next_beat = 0, .awaiting_ack = false, .fatal = String.new(), .failures = 0, .next_connect = 0 }
+    }
+
+    /// Asks for `intents` from the next Identify on; a session keeps the
+    /// intents it was identified with, so a change forgets it. Whether
+    /// anything changed.
+    pub fn set_intents(self: *mut Self, intents: u64) -> bool {
+        if intents == self.intents {
+            return false
+        }
+        self.intents = intents
+        self.forget_session()
+        return true
+    }
+
+    /// Whether a new connection would resume rather than identify.
+    pub fn can_resume(self: *Self) -> bool {
+        return self.session_id.len > 0 and self.seq >= 0
+    }
+
+    /// The URL the next connection goes to: where READY said to resume,
+    /// when there is a session to resume.
+    pub fn url(self: *Self) -> String {
+        if self.can_resume() and self.resume_url.len > 0 {
+            var u = self.resume_url.clone()
+            if !u[..].ends_with("/") { u.push_byte('/') }
+            u.append("?v=10&encoding=json")
+            return u
+        }
+        return String.from(DEFAULT_URL)
+    }
+
+    fn heartbeat(self: *Self) -> String {
+        if self.seq >= 0 {
+            return format("{{\"op\":1,\"d\":{}}}", .{self.seq})
+        }
+        return String.from("{\"op\":1,\"d\":null}")
+    }
+
+    fn identify(self: *Self) -> String {
+        var props = js.obj()
+        js.put_str(&mut props, "os", @target().0)
+        js.put_str(&mut props, "browser", "nexium-discord")
+        js.put_str(&mut props, "device", "nexium-discord")
+        var d = js.obj()
+        js.put_str(&mut d, "token", self.token)
+        js.put_int(&mut d, "intents", self.intents as i64)
+        js.put(&mut d, "properties", props)
+        var o = js.obj()
+        js.put_int(&mut o, "op", IDENTIFY)
+        js.put(&mut o, "d", d)
+        return json.stringify(&o)
+    }
+
+    fn resume(self: *Self) -> String {
+        var d = js.obj()
+        js.put_str(&mut d, "token", self.token)
+        js.put_str(&mut d, "session_id", self.session_id)
+        js.put_int(&mut d, "seq", self.seq)
+        var o = js.obj()
+        js.put_int(&mut o, "op", RESUME)
+        js.put(&mut o, "d", d)
+        return json.stringify(&o)
+    }
+
+    fn forget_session(self: *mut Self) {
+        self.session_id = String.new()
+        self.resume_url = String.new()
+        self.seq = -1
+    }
+
+    /// A new connection is open (its WebSocket handshake done).
+    pub fn connected(self: *mut Self) {
+        self.hello = false
+        self.ready = false
+        self.awaiting_ack = false
+    }
+
+    /// One text message from the Gateway, at `now` (ms).
+    pub fn on_text(self: *mut Self, text: []u8, now: i64) -> Step {
+        var out = step()
+        let v = json.parse(text) catch {
+            // not JSON: the connection is not worth trusting
+            out.close = RESUME_CLOSE
+            return out
+        }
+        let op = js.int(&v, "op", -1)
+        if op == DISPATCH {
+            let s = js.int(&v, "s", -1)
+            if s >= 0 {
+                self.seq = s
+            }
+            let name = js.str(&v, "t")
+            if name == "READY" {
+                if let d = json.get(&v, "d") {
+                    self.session_id = String.from(js.str(d, "session_id"))
+                    self.resume_url = String.from(js.str(d, "resume_gateway_url"))
+                    if let u = json.get(d, "user") {
+                        self.user_id = String.from(js.str(u, "id"))
+                    }
+                    if let a = json.get(d, "application") {
+                        self.application_id = String.from(js.str(a, "id"))
+                    }
+                }
+                self.ready = true
+                self.failures = 0
+            } else if name == "RESUMED" {
+                self.ready = true
+                self.failures = 0
+            }
+            out.dispatches.append(Dispatch{ .name = String.from(name), .raw = String.from(text) })
+        } else if op == HELLO {
+            var interval: i64 = 41250
+            if let d = json.get(&v, "d") {
+                interval = js.int(d, "heartbeat_interval", 41250)
+            }
+            self.interval = @max(interval, 1000)
+            self.hello = true
+            self.awaiting_ack = false
+            // the first heartbeat after a random part of the interval
+            self.next_beat = now + ((self.interval as f64) * random.float()) as i64
+            if self.can_resume() {
+                out.send.append(self.resume())
+            } else {
+                out.send.append(self.identify())
+            }
+        } else if op == HEARTBEAT_ACK {
+            self.awaiting_ack = false
+        } else if op == HEARTBEAT {
+            // the server asks for one now
+            out.send.append(self.heartbeat())
+        } else if op == RECONNECT {
+            out.close = RESUME_CLOSE
+        } else if op == INVALID_SESSION {
+            var resumable = false
+            if let d = json.get(&v, "d") {
+                resumable = json.as_bool(d) orelse false
+            }
+            if !resumable {
+                self.forget_session()
+            }
+            out.close = RESUME_CLOSE
+        }
+        return out
+    }
+
+    /// A heartbeat when one is due, or a close when the last one was never
+    /// acknowledged.
+    pub fn tick(self: *mut Self, now: i64) -> Step {
+        var out = step()
+        if !self.hello or now < self.next_beat {
+            return out
+        }
+        if self.awaiting_ack {
+            out.close = RESUME_CLOSE
+            return out
+        }
+        out.send.append(self.heartbeat())
+        self.awaiting_ack = true
+        self.next_beat = now + self.interval
+        return out
+    }
+
+    /// How long until the next heartbeat is due (at most `cap`).
+    pub fn ms_until_beat(self: *Self, now: i64, cap: i64) -> i64 {
+        if !self.hello {
+            return cap
+        }
+        return @min(@max(self.next_beat - now, 0), cap)
+    }
+
+    /// The connection ended: with the server's close `code`, or 0 when it
+    /// broke or the bot closed it. Sets when to connect again, or `fatal`.
+    pub fn closed(self: *mut Self, code: u16, now: i64) {
+        self.hello = false
+        self.ready = false
+        self.awaiting_ack = false
+        if code == 4004 {
+            self.fatal = String.from("Discord refused the bot token (close 4004): check it in the Developer Portal, Bot tab")
+        } else if code == 4010 or code == 4011 or code == 4012 {
+            self.fatal = format("Discord closed the Gateway with {}, which no retry fixes", .{code})
+        } else if code == 4013 or code == 4014 {
+            let privileged = self.intents & PRIVILEGED
+            if privileged != 0 {
+                self.fatal = format("Discord refused the Gateway intents (close {}): the bot asks for privileged ones ({}: Server Members is 2, Presence 256, Message Content 32768), which the Developer Portal must allow on the Bot tab", .{code, privileged})
+            } else {
+                self.fatal = format("Discord refused the Gateway intents (close {})", .{code})
+            }
+        }
+        if self.fatal.len > 0 {
+            return
+        }
+        // the session cannot be resumed after these
+        if code == 1000 or code == 1001 or code == 4007 or code == 4009 {
+            self.forget_session()
+        }
+        // 1 s, 2 s, 4 s ... up to a minute, with some jitter
+        let base = @min(1000 * (1 << @min(self.failures, 6)), 60000)
+        self.failures += 1
+        self.next_connect = now + (base as i64) + random.int(0, 999)
+    }
+}
+
+// ------------------------------------------------------------------ tests
+
+fn sent_op(s: []u8) -> i64 {
+    let v = json.parse(s) catch {
+        panic("sent JSON")
+    }
+    return js.int(&v, "op", -1)
+}
+
+test "a session: Hello, Identify, READY, heartbeats with the sequence, and ACKs" {
+    random.seed(1)
+    var g = Gateway.new("secret-token", GUILDS)
+    g.connected()
+    let hello = g.on_text("{\"op\":10,\"d\":{\"heartbeat_interval\":40000},\"s\":null,\"t\":null}", 1000)
+    expect_eq(hello.send.len, 1)
+    expect_eq(sent_op(hello.send[0]), 2)
+    expect(hello.send[0].find("\"token\":\"secret-token\"") != null)
+    expect(hello.send[0].find("\"intents\":1") != null)
+    expect(hello.send[0].find("\"browser\":\"nexium-discord\"") != null)
+    // the first heartbeat within the first interval
+    expect(g.next_beat >= 1000 and g.next_beat <= 41000)
+    expect_eq(g.tick(g.next_beat - 1).send.len, 0)
+    let ready = g.on_text("{\"op\":0,\"s\":1,\"t\":\"READY\",\"d\":{\"session_id\":\"abc\",\"user\":{\"id\":\"555\"},\"application\":{\"id\":\"777\"},\"resume_gateway_url\":\"wss://elsewhere.discord.gg\"}}", 2000)
+    expect_eq(ready.dispatches.len, 1)
+    expect_eq(ready.dispatches[0].name, "READY")
+    expect(g.ready)
+    expect_eq(g.session_id, "abc")
+    expect_eq(g.user_id, "555")
+    expect_eq(g.application_id, "777")
+    expect_eq(g.url(), "wss://elsewhere.discord.gg/?v=10&encoding=json")
+    let beat = g.tick(g.next_beat)
+    expect_eq(beat.send.len, 1)
+    expect_eq(beat.send[0], "{\"op\":1,\"d\":1}")
+    _ = g.on_text("{\"op\":11}", g.next_beat - 30000)
+    // a dispatch moves the sequence on
+    let ix = g.on_text("{\"op\":0,\"s\":7,\"t\":\"INTERACTION_CREATE\",\"d\":{\"id\":\"9\"}}", 50000)
+    expect_eq(ix.dispatches[0].name, "INTERACTION_CREATE")
+    expect(ix.dispatches[0].raw.find("\"id\":\"9\"") != null)
+    expect_eq(g.tick(g.next_beat).send[0], "{\"op\":1,\"d\":7}")
+    // the server asks for a heartbeat out of turn
+    expect_eq(g.on_text("{\"op\":1,\"d\":null}", 60000).send[0], "{\"op\":1,\"d\":7}")
+}
+
+test "a heartbeat never acknowledged: close, and resume on the next connection" {
+    random.seed(2)
+    var g = Gateway.new("t", GUILDS)
+    g.connected()
+    _ = g.on_text("{\"op\":10,\"d\":{\"heartbeat_interval\":10000}}", 0)
+    _ = g.on_text("{\"op\":0,\"s\":3,\"t\":\"READY\",\"d\":{\"session_id\":\"s1\",\"user\":{\"id\":\"1\"}}}", 1)
+    expect_eq(g.tick(g.next_beat).send.len, 1)
+    // no ACK before the next one is due
+    let dead = g.tick(g.next_beat)
+    expect_eq(dead.close, RESUME_CLOSE)
+    g.closed(0, 30000)
+    expect(g.can_resume())
+    expect(g.next_connect >= 31000 and g.next_connect < 32000)
+    // no resume URL was given: the default one
+    expect_eq(g.url(), DEFAULT_URL)
+    g.connected()
+    let again = g.on_text("{\"op\":10,\"d\":{\"heartbeat_interval\":10000}}", 32000)
+    expect_eq(sent_op(again.send[0]), 6)
+    expect(again.send[0].find("\"session_id\":\"s1\"") != null)
+    expect(again.send[0].find("\"seq\":3") != null)
+    let resumed = g.on_text("{\"op\":0,\"s\":4,\"t\":\"RESUMED\",\"d\":null}", 32100)
+    expect_eq(resumed.dispatches[0].name, "RESUMED")
+    expect(g.ready)
+    expect_eq(g.failures, 0)
+}
+
+test "Reconnect, Invalid Session and close codes" {
+    random.seed(3)
+    var g = Gateway.new("t", GUILDS)
+    g.connected()
+    _ = g.on_text("{\"op\":10,\"d\":{\"heartbeat_interval\":10000}}", 0)
+    _ = g.on_text("{\"op\":0,\"s\":5,\"t\":\"READY\",\"d\":{\"session_id\":\"s1\",\"user\":{\"id\":\"1\"}}}", 1)
+    expect_eq(g.on_text("{\"op\":7,\"d\":null}", 2).close, RESUME_CLOSE)
+    // Invalid Session, resumable: keep the session
+    expect_eq(g.on_text("{\"op\":9,\"d\":true}", 3).close, RESUME_CLOSE)
+    expect(g.can_resume())
+    // not resumable: identify next time
+    expect_eq(g.on_text("{\"op\":9,\"d\":false}", 4).close, RESUME_CLOSE)
+    expect(!g.can_resume())
+    // 4009 (session timed out) forgets it too
+    var h = Gateway.new("t", GUILDS)
+    h.session_id = String.from("x")
+    h.seq = 2
+    h.closed(4009, 0)
+    expect(!h.can_resume())
+    expect_eq(h.fatal, "")
+    // a broken connection keeps it, and the waits grow to a minute
+    var k = Gateway.new("t", GUILDS)
+    k.session_id = String.from("x")
+    k.seq = 2
+    var last: i64 = 0
+    for _ in 0..10 {
+        k.closed(0, 0)
+        last = k.next_connect
+    }
+    expect(k.can_resume())
+    expect(last >= 60000 and last < 61000)
+    // a garbled message is not trusted
+    expect_eq(k.on_text("not json", 0).close, RESUME_CLOSE)
+}
+
+test "codes no retry fixes stop the Gateway, saying what to do" {
+    var bad = Gateway.new("t", GUILDS)
+    bad.closed(4004, 0)
+    expect(bad.fatal.find("bot token") != null)
+    var content = Gateway.new("t", GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT)
+    content.closed(4014, 0)
+    expect(content.fatal.find("privileged") != null)
+    expect(content.fatal.find("32768") != null)
+    var plain = Gateway.new("t", GUILDS)
+    plain.closed(4013, 0)
+    expect(plain.fatal.len > 0)
+    var shard = Gateway.new("t", GUILDS)
+    shard.closed(4011, 0)
+    expect(shard.fatal.len > 0)
+}
+
+test "no heartbeat before Hello, and the loop's wait follows the next one" {
+    var g = Gateway.new("t", GUILDS)
+    g.connected()
+    expect_eq(g.tick(1000000).send.len, 0)
+    expect_eq(g.ms_until_beat(0, 500), 500)
+    random.seed(4)
+    _ = g.on_text("{\"op\":10,\"d\":{\"heartbeat_interval\":40000}}", 0)
+    expect(g.ms_until_beat(0, 60000) <= 40000)
+    expect_eq(g.ms_until_beat(g.next_beat + 5, 500), 0)
+    // an interval too short to be real is raised to a second
+    var h = Gateway.new("t", GUILDS)
+    h.connected()
+    _ = h.on_text("{\"op\":10,\"d\":{\"heartbeat_interval\":1}}", 0)
+    expect_eq(h.interval, 1000)
+}
+
+test "other intents mean a new session" {
+    var g = Gateway.new("t", GUILDS)
+    g.session_id = String.from("s")
+    g.seq = 3
+    expect(!g.set_intents(GUILDS))
+    expect(g.can_resume())
+    expect(g.set_intents(GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT))
+    expect(!g.can_resume())
+    let hello = g.on_text("{\"op\":10,\"d\":{\"heartbeat_interval\":45000}}", 0)
+    expect(hello.send[0].find("\"intents\":33281") != null)
+}

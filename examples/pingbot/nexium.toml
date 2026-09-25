@@ -1,0 +1,6 @@
+[package]
+name = "pingbot"
+version = "0.1.0"
+
+[dependencies]
+discord = { path = "../.." }

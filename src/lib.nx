@@ -1,0 +1,573 @@
+// discord: a Discord bot library for Nexium. The gateway (identify,
+// heartbeats, resume, reconnects), the REST calls a bot makes (messages,
+// interaction answers and follow-ups, reactions, slash commands), and the
+// events as an enum to `match` on. TLS is nxtls's, in std.http's slot.
+//
+//     import discord
+//     import discord.interaction
+//
+//     fn main() -> !void {
+//         var tls = try discord.layers()                          // the system's roots
+//         var bot = try discord.from_env(&mut tls, discord.GUILDS)   // $DISCORD_TOKEN
+//         while true {
+//             let ev = try bot.next()
+//             match ev {
+//                 .InteractionCreate(ix) => {
+//                     if ix.command == "ping" { try bot.respond(&ix, interaction.reply_text("pong")[..]) }
+//                 }
+//                 else => { }
+//             }
+//         }
+//     }
+//
+// The modules: `event` (what `next` returns), `message` (building
+// messages, embeds, buttons, menus, forms), `interaction` (slash commands
+// and buttons as they arrive, and the answers), `command` (slash command
+// definitions), `gateway` (the protocol, as a state machine), `layer`
+// (nxtls behind std.http's Transport). A call that fails for Discord's
+// reason says it in `bot.problem`; the token is never in it.
+
+import std.http
+import std.json
+import std.time
+import std.websocket
+import gateway
+import event
+import interaction
+import message
+import layer
+import js
+
+/// Gateway intents (see `gateway` for all of them): or them together.
+pub const GUILDS: u64 = 1
+pub const GUILD_MEMBERS: u64 = 2
+pub const GUILD_MESSAGES: u64 = 512
+pub const GUILD_MESSAGE_REACTIONS: u64 = 1024
+pub const DIRECT_MESSAGES: u64 = 4096
+pub const MESSAGE_CONTENT: u64 = 32768
+
+/// Where the REST calls go.
+pub const API: []u8 = "https://discord.com/api/v10"
+
+// Discord asks bots to name themselves this way
+const USER_AGENT: []u8 = "DiscordBot (https://github.com/Londopy/nexium-discord, 0.1.0)"
+
+/// What a REST call answered: its status and its body (JSON, as a rule).
+pub struct Answer {
+    status: u16
+    body: String
+}
+
+/// A bot: the gateway session and the REST calls, over transports of type
+/// `T` (`layer.Layer` for Discord itself; a test gives its own).
+pub struct Bot(T){
+    token: String
+    rest: *mut T
+    gateway_transport: *mut T
+    sock: websocket.Socket(T)
+    gw: gateway.Gateway
+    connected: bool
+    queue: List(event.Event)
+    /// the application's id: READY's, or asked for by `app_id`
+    application_id: String
+    /// why the bot stopped, or what Discord said when a call failed
+    problem: String
+    /// ms a connect and its TLS handshake may take
+    timeout_ms: i64 = 15000
+}
+
+/// TLS layers for a bot, over the system's trusted roots.
+pub fn layers() -> !layer.Layers {
+    return layer.layers()
+}
+
+/// A bot with the token in `$DISCORD_TOKEN`, over `tls`; it connects at
+/// its first `next`. `error.NotFound` when the variable is not set.
+pub fn from_env(tls: *mut layer.Layers, intents: u64) -> !Bot(layer.Layer) {
+    let token = os.env("DISCORD_TOKEN") orelse return error.NotFound
+    if token.len == 0 { return error.NotFound }
+    var b = make(layer.Layer, &mut tls.rest, &mut tls.gateway, intents)
+    b.token = String.from(token)
+    b.gw.token = String.from(token)
+    return b
+}
+
+/// A bot with this token, over `tls`.
+pub fn with_token(tls: *mut layer.Layers, token: []u8, intents: u64) -> Bot(layer.Layer) {
+    var b = make(layer.Layer, &mut tls.rest, &mut tls.gateway, intents)
+    b.token = String.from(token)
+    b.gw.token = String.from(token)
+    return b
+}
+
+/// A bot over transports of the program's own, `rest` for the REST calls
+/// and `gateway_transport` for the gateway's WebSocket (two, since the
+/// gateway's connection stays open); set `token` and `gw.token` before its
+/// first call.
+pub fn make(comptime T: type where T: http.Transport, rest: *mut T, gateway_transport: *mut T, intents: u64) -> Bot(T) {
+    return Bot(T){ .token = String.new(), .rest = rest, .gateway_transport = gateway_transport, .sock = websocket.socket(T, gateway_transport), .gw = gateway.Gateway.new("", intents), .connected = false, .queue = List(event.Event).new(), .application_id = String.new(), .problem = String.new() }
+}
+
+// JSON text as a value, or null when it is not JSON
+fn parsed(text: []u8) -> ?json.Json {
+    let v = json.parse(text) catch { return null }
+    return v
+}
+
+// how long a 429 asks to wait, in ms: its JSON's retry_after (seconds),
+// else its Retry-After header
+fn retry_after_ms(r: *http.Response) -> u64 {
+    var ms: i64 = 1000
+    if let v = parsed(r.body[..]) {
+        if let ra = json.get(&v, "retry_after") {
+            if let secs = json.as_num(ra) { ms = (secs * 1000.0) as i64 }
+        }
+    } else if let h = r.header("retry-after") {
+        let secs = h.parse_int(i64) catch { 1 }
+        ms = secs * 1000
+    }
+    return @min(@max(ms, 10), 60000) as u64
+}
+
+// Discord's word on a refusal: its message and code, else the body's start
+fn refusal(status: u16, body: []u8) -> String {
+    if let v = parsed(body) {
+        let msg = js.str(&v, "message")
+        if msg.len > 0 {
+            let code = js.int(&v, "code", 0)
+            if code != 0 { return format("{} {} ({})", .{status, msg, code}) }
+            return format("{} {}", .{status, msg})
+        }
+    }
+    return format("{} {}", .{status, body[0..@min(body.len, 200)]})
+}
+
+// the id in a JSON answer
+fn id_of(body: []u8) -> !String {
+    let v = json.parse(body) catch { return error.InvalidInput }
+    let id = js.str(&v, "id")
+    if id.len == 0 { return error.InvalidInput }
+    return String.from(id)
+}
+
+// `s` for a URL's path: the unreserved characters as they are, every other
+// byte as %XX
+fn escape(s: []u8) -> String {
+    let hex = "0123456789ABCDEF"
+    var out = String.new()
+    for c in s {
+        if (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '-' or c == '_' or c == '.' or c == '~' {
+            out.push_byte(c)
+        } else {
+            out.push_byte('%')
+            out.push_byte(hex[(c >> 4) as usize])
+            out.push_byte(hex[(c & 15) as usize])
+        }
+    }
+    return out
+}
+
+impl(T) Bot(T) {
+    /// The next event from the gateway, connecting first when need be.
+    /// Heartbeats, reconnects and resumes happen inside, with waits that
+    /// grow to a minute while Discord cannot be reached. A close that no
+    /// retry fixes (a bad token, intents the application may not use) is
+    /// `error.Refused`, with `problem` saying what to do.
+    pub fn next(self: *mut Self) -> !event.Event {
+        while true {
+            if self.queue.len > 0 { return self.queue.remove(0) }
+            if self.gw.fatal.len > 0 {
+                self.problem = self.gw.fatal.clone()
+                return error.Refused
+            }
+            if !self.connected {
+                let wait = self.gw.next_connect - time.now()
+                if wait > 0 { time.sleep(wait as u64) }
+                let url = self.gw.url()
+                self.sock = websocket.socket(T, self.gateway_transport)
+                self.sock.open(url[..], self.timeout_ms) catch |e| {
+                    self.problem = format("the gateway could not be reached: {} {}", .{@errorName(e), self.sock.problem})
+                    self.gw.closed(0, time.now())
+                    continue
+                }
+                self.gw.connected()
+                self.connected = true
+                continue
+            }
+            self.sock.set_timeout(@max(self.gw.ms_until_beat(time.now(), 30000), 50))
+            let m = self.sock.recv() catch |e| {
+                if e == error.Timeout {
+                    self.apply(self.gw.tick(time.now()))
+                    continue
+                }
+                // the connection broke, or the server broke the protocol
+                self.connected = false
+                self.gw.closed(0, time.now())
+                continue
+            }
+            if m.op == websocket.TEXT {
+                self.apply(self.gw.on_text(m.data[..], time.now()))
+                if self.application_id.len == 0 and self.gw.application_id.len > 0 {
+                    self.application_id = self.gw.application_id.clone()
+                }
+            } else if m.op == websocket.CLOSE {
+                self.connected = false
+                // 1005 and 1006: no code, or no close at all
+                let code: u16 = if m.code == 1005 or m.code == 1006 { 0 } else { m.code }
+                self.gw.closed(code, time.now())
+            }
+        }
+    }
+
+    // what the gateway said to do: send, queue the events, close
+    fn apply(self: *mut Self, own st: gateway.Step) {
+        for p in st.send {
+            // a send that fails shows as a broken connection at the next recv
+            self.sock.send_text(p[..]) catch { }
+        }
+        for d in st.dispatches {
+            self.queue.append(event.parse(d.name[..], d.raw[..]))
+        }
+        if st.close != 0 {
+            self.sock.close(st.close, "")
+            self.connected = false
+            self.gw.closed(0, time.now())
+        }
+    }
+
+    /// Ends the gateway session; a later `next` identifies anew.
+    pub fn close(self: *mut Self) {
+        if self.connected { self.sock.close(1000, "") }
+        self.connected = false
+        self.gw.closed(1000, time.now())
+    }
+
+    /// A REST call: `method` on `path` (after /api/v10) with a JSON `body`
+    /// ("" for none). A 429 waits as long as Discord asks and tries again,
+    /// five times at most, and so do answers of 500 and up and failed
+    /// connections, three times, 1, 2 and 4 s apart. Any other answer is
+    /// returned; one of 400 and up puts Discord's message in `problem`.
+    pub fn api(self: *mut Self, method: []u8, path: []u8, body: []u8) -> !Answer {
+        var limited: u32 = 0
+        var failed: u32 = 0
+        while true {
+            var c = http.client_with(T, self.rest)
+            c.timeout_ms = self.timeout_ms
+            c.max_redirects = 0
+            c.headers.append(http.Header{ .name = String.from("Authorization"), .value = format("Bot {}", .{self.token}) })
+            c.headers.append(http.Header{ .name = String.from("User-Agent"), .value = String.from(USER_AGENT) })
+            var hs = List(http.Header).new()
+            if body.len > 0 {
+                hs.append(http.Header{ .name = String.from("Content-Type"), .value = String.from("application/json") })
+            }
+            let url = format("{}{}", .{API, path})
+            let r = c.send(method, url[..], &hs, body) catch |e| {
+                failed += 1
+                if failed > 3 {
+                    self.problem = format("{} {}: {}", .{method, path, @errorName(e)})
+                    return e
+                }
+                time.sleep((1000 << (failed - 1)) as u64)
+                continue
+            }
+            if r.status == 429 and limited < 5 {
+                limited += 1
+                time.sleep(retry_after_ms(&r))
+                continue
+            }
+            if r.status >= 500 and failed < 3 {
+                failed += 1
+                time.sleep((1000 << (failed - 1)) as u64)
+                continue
+            }
+            if r.status >= 400 { self.problem = format("{} {}: {}", .{method, path, refusal(r.status, r.body[..])}) }
+            return Answer{ .status = r.status, .body = r.body.clone() }
+        }
+    }
+
+    // `api`, and error.Refused for an answer that is not a success
+    fn call(self: *mut Self, method: []u8, path: []u8, body: []u8) -> !Answer {
+        let a = try self.api(method, path, body)
+        if a.status >= 300 { return error.Refused }
+        return a
+    }
+
+    /// Posts a message of text to a channel; its id.
+    pub fn send(self: *mut Self, channel_id: []u8, content: []u8) -> !String {
+        let m = message.content(content)
+        return self.post(channel_id, &m)
+    }
+
+    /// Posts a built message to a channel; its id.
+    pub fn post(self: *mut Self, channel_id: []u8, m: *message.Message) -> !String {
+        let body = message.to_json(m)
+        let a = try self.call("POST", format("/channels/{}/messages", .{channel_id})[..], body[..])
+        return id_of(a.body[..])
+    }
+
+    /// Changes a message the bot posted.
+    pub fn edit(self: *mut Self, channel_id: []u8, message_id: []u8, m: *message.Message) -> !void {
+        let body = message.to_json(m)
+        _ = try self.call("PATCH", format("/channels/{}/messages/{}", .{channel_id, message_id})[..], body[..])
+    }
+
+    /// Deletes a message: the bot's, or another's with Manage Messages.
+    pub fn delete(self: *mut Self, channel_id: []u8, message_id: []u8) -> !void {
+        _ = try self.call("DELETE", format("/channels/{}/messages/{}", .{channel_id, message_id})[..], "")
+    }
+
+    /// Adds the bot's reaction to a message: a Unicode emoji, or name:id
+    /// for a server's own.
+    pub fn react(self: *mut Self, channel_id: []u8, message_id: []u8, emoji: []u8) -> !void {
+        let e = escape(emoji)
+        _ = try self.call("PUT", format("/channels/{}/messages/{}/reactions/{}/@me", .{channel_id, message_id, e})[..], "")
+    }
+
+    /// Answers an interaction, within three seconds of it: `response` is
+    /// `interaction.reply`, `reply_text`, `deferred`, `update`, `modal` or
+    /// `choices`.
+    pub fn respond(self: *mut Self, ix: *interaction.Interaction, response: []u8) -> !void {
+        _ = try self.call("POST", format("/interactions/{}/{}/callback", .{ix.id, ix.token})[..], response)
+    }
+
+    /// Another message about an interaction: the real answer after
+    /// `deferred`, or more after the first. Its id.
+    pub fn followup(self: *mut Self, ix: *interaction.Interaction, m: *message.Message) -> !String {
+        let body = message.to_json(m)
+        let a = try self.call("POST", format("/webhooks/{}/{}", .{ix.app_id, ix.token})[..], body[..])
+        return id_of(a.body[..])
+    }
+
+    /// Changes an interaction's first answer, or fills in a `deferred` one.
+    pub fn edit_reply(self: *mut Self, ix: *interaction.Interaction, m: *message.Message) -> !void {
+        let body = message.to_json(m)
+        _ = try self.call("PATCH", format("/webhooks/{}/{}/messages/@original", .{ix.app_id, ix.token})[..], body[..])
+    }
+
+    /// The application's id: READY's, or Discord's answer about the bot's
+    /// application.
+    pub fn app_id(self: *mut Self) -> !String {
+        if self.application_id.len > 0 { return self.application_id.clone() }
+        let a = try self.call("GET", "/applications/@me", "")
+        self.application_id = try id_of(a.body[..])
+        return self.application_id.clone()
+    }
+
+    /// Registers slash commands (`command.command`), replacing the ones the
+    /// application had: in every server, or in the one `guild_id` names
+    /// (at once there, where the global list takes up to an hour to show).
+    pub fn register(self: *mut Self, guild_id: []u8, commands: *List(json.Json)) -> !void {
+        let app = try self.app_id()
+        var body = String.from("[")
+        for c, i in commands.* {
+            if i > 0 { body.push_byte(',') }
+            body.append(json.stringify(&c))
+        }
+        body.push_byte(']')
+        let path = if guild_id.len > 0 { format("/applications/{}/guilds/{}/commands", .{app, guild_id}) } else { format("/applications/{}/commands", .{app}) }
+        _ = try self.call("PUT", path[..], body[..])
+    }
+}
+
+// ------------------------------------------------------------------ tests
+
+/// A Discord played from a script. Each connect takes the next canned
+/// reply; a gateway connection answers the WebSocket handshake first, then
+/// sends its frames. What was sent over each connection, and where to, is
+/// kept.
+struct Fake {
+    replies: List(String)
+    gateway: bool
+    next: usize
+    out: String
+    handshake: bool
+    sent: List(String)
+    hosts: List(String)
+}
+
+fn fake(replies: [][]u8, is_gateway: bool) -> Fake {
+    var r = List(String).new()
+    for x in replies { r.append(String.from(x)) }
+    return Fake{ .replies = r, .gateway = is_gateway, .next = 0, .out = String.new(), .handshake = false, .sent = List(String).new(), .hosts = List(String).new() }
+}
+
+impl http.Transport for Fake {
+    fn connect(self: *mut Self, host: []u8, port: u16, timeout_ms: i64) -> !void {
+        _ = timeout_ms
+        if self.next >= self.replies.len { return error.ConnectionRefused }
+        self.out = self.replies[self.next].clone()
+        self.next += 1
+        self.handshake = self.gateway
+        self.hosts.append(format("{}:{}", .{host, port}))
+        self.sent.append(String.new())
+    }
+
+    fn send(self: *mut Self, data: []u8) -> !void {
+        self.sent[self.sent.len - 1].append(data)
+    }
+
+    fn recv(self: *mut Self) -> !String {
+        if self.handshake {
+            let s = self.sent[self.sent.len - 1][..]
+            let k = s.find("Sec-WebSocket-Key: ").? + 19
+            var e = k
+            while s[e] != '\r' { e += 1 }
+            var answer = format("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n", .{websocket.accept_for(s[k..e])})
+            answer.append(self.out)
+            self.handshake = false
+            self.out = String.new()
+            return answer
+        }
+        let piece = self.out.clone()
+        self.out = String.new()
+        return piece
+    }
+
+    fn set_timeout(self: *mut Self, ms: i64) {
+        _ = self
+        _ = ms
+    }
+
+    fn truncated(self: *Self) -> bool {
+        _ = self
+        return false
+    }
+
+    fn close(self: *mut Self) {
+        self.out = String.new()
+    }
+}
+
+// a text frame as a server sends it, unmasked
+fn frame(text: []u8) -> String {
+    var f = String.new()
+    f.push_byte(0x81)
+    if text.len < 126 {
+        f.push_byte(text.len as u8)
+    } else {
+        f.push_byte(126)
+        f.push_byte((text.len >> 8) as u8)
+        f.push_byte((text.len & 255) as u8)
+    }
+    f.append(text)
+    return f
+}
+
+// the text frames a client sent after its handshake, unmasked
+fn client_texts(sent: []u8) -> List(String) {
+    var out = List(String).new()
+    var at = sent.find("\r\n\r\n").? + 4
+    while at + 6 <= sent.len {
+        var n = (sent[at + 1] & 0x7f) as usize
+        var h = at + 2
+        if n == 126 {
+            n = ((sent[at + 2] as usize) << 8) | (sent[at + 3] as usize)
+            h = at + 4
+        }
+        let mask = sent[h..h + 4]
+        var p = String.new()
+        for i in 0..n { p.push_byte(sent[h + 4 + i] ^ mask[i % 4]) }
+        if (sent[at] & 0x0f) == 1 { out.append(p) }
+        at = h + 4 + n
+    }
+    return out
+}
+
+// an HTTP answer as Discord's REST API gives one
+fn answer(status: []u8, body: []u8) -> String {
+    return format("HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", .{status, body.len, body})
+}
+
+test "a gateway session, and a resume after the connection drops" {
+    random.seed(7)
+    var s1 = frame("{\"op\":10,\"d\":{\"heartbeat_interval\":600000}}")
+    s1.append(frame("{\"op\":0,\"s\":1,\"t\":\"READY\",\"d\":{\"session_id\":\"abc\",\"resume_gateway_url\":\"wss://resume.example\",\"user\":{\"id\":\"42\",\"username\":\"helper\",\"bot\":true},\"application\":{\"id\":\"42\"},\"guilds\":[]}}"))
+    s1.append(frame("{\"op\":0,\"s\":2,\"t\":\"MESSAGE_CREATE\",\"d\":{\"id\":\"100\",\"channel_id\":\"200\",\"author\":{\"id\":\"9\",\"username\":\"sam\"},\"content\":\"!ping\"}}"))
+    var s2 = frame("{\"op\":10,\"d\":{\"heartbeat_interval\":600000}}")
+    s2.append(frame("{\"op\":0,\"s\":3,\"t\":\"RESUMED\",\"d\":null}"))
+    let first_conn = s1
+    let second_conn = s2
+    var gw = fake([first_conn[..], second_conn[..]][..], true)
+    var rest = fake([], false)
+    var bot = make(Fake, &mut rest, &mut gw, GUILDS | GUILD_MESSAGES)
+    bot.token = String.from("tok")
+    bot.gw.token = String.from("tok")
+    match try bot.next() {
+        .Ready(r) => { expect_eq(r.user.name, "helper") }
+        else => { expect(false) }
+    }
+    expect_eq(bot.application_id, "42")
+    match try bot.next() {
+        .MessageCreate(m) => { expect_eq(m.content, "!ping") }
+        else => { expect(false) }
+    }
+    // the connection ends: a new one, at READY's URL, resumes the session
+    match try bot.next() {
+        .Resumed => { }
+        else => { expect(false) }
+    }
+    expect_eq(gw.hosts[0], "gateway.discord.gg:443")
+    expect_eq(gw.hosts[1], "resume.example:443")
+    let first = client_texts(gw.sent[0][..])
+    expect(first[0][..].find("\"op\":2") != null and first[0][..].find("\"token\":\"tok\"") != null)
+    expect(first[0][..].find("\"intents\":513") != null)
+    let second = client_texts(gw.sent[1][..])
+    expect(second[0][..].find("\"op\":6") != null and second[0][..].find("\"seq\":2") != null)
+}
+
+test "a bad token stops the bot, saying so" {
+    var s1 = frame("{\"op\":10,\"d\":{\"heartbeat_interval\":600000}}")
+    // close 4004: authentication failed
+    s1.append(b"\x88\x02\x0f\xa4")
+    let only = s1
+    var gw = fake([only[..]][..], true)
+    var rest = fake([], false)
+    var bot = make(Fake, &mut rest, &mut gw, GUILDS)
+    var refused = false
+    _ = bot.next() catch |e| {
+        refused = e == error.Refused
+        event.Event.Resumed
+    }
+    expect(refused)
+    expect(bot.problem[..].find("4004") != null)
+}
+
+test "REST calls: rate limits waited out, refusals said" {
+    var rest = fake([
+        answer("429 Too Many Requests", "{\"message\": \"You are being rate limited.\", \"retry_after\": 0.05, \"global\": false}")[..],
+        answer("200 OK", "{\"id\":\"m1\",\"content\":\"hello\"}")[..],
+        answer("403 Forbidden", "{\"message\": \"Missing Permissions\", \"code\": 50013}")[..],
+        answer("200 OK", "[]")[..],
+    ][..], false)
+    var gw = fake([], true)
+    var bot = make(Fake, &mut rest, &mut gw, GUILDS)
+    bot.token = String.from("tok")
+    expect_eq(try bot.send("200", "hello"), "m1")
+    expect_eq(rest.sent.len, 2)
+    let post = rest.sent[1][..]
+    expect(post.starts_with("POST /api/v10/channels/200/messages HTTP/1.1\r\nHost: discord.com\r\n"))
+    expect(post.find("Authorization: Bot tok\r\n") != null)
+    expect(post.find("User-Agent: DiscordBot (") != null)
+    expect(post.find("\r\n\r\n{\"content\":\"hello\"") != null)
+    var refused = false
+    bot.react("200", "100", "👍") catch |e| { refused = e == error.Refused }
+    expect(refused)
+    expect_eq(bot.problem, "PUT /channels/200/messages/100/reactions/%F0%9F%91%8D/@me: 403 Missing Permissions (50013)")
+    expect(bot.problem[..].find("tok") == null)
+    // commands: the application's id from READY, the list replaced whole
+    bot.application_id = String.from("42")
+    var defs = List(json.Json).new()
+    var ping = js.obj()
+    js.put_str(&mut ping, "name", "ping")
+    defs.append(ping)
+    try bot.register("7", &defs)
+    expect(rest.sent[3][..].starts_with("PUT /api/v10/applications/42/guilds/7/commands HTTP/1.1\r\n"))
+    expect(rest.sent[3][..].ends_with("\r\n\r\n[{\"name\":\"ping\"}]"))
+}
+
+test "URL escapes and Discord's words" {
+    expect_eq(escape("party:555"), "party%3A555")
+    expect_eq(escape("✅"), "%E2%9C%85")
+    expect_eq(refusal(403, "{\"message\":\"Missing Access\",\"code\":50001}"), "403 Missing Access (50001)")
+    expect_eq(refusal(502, "Bad Gateway"), "502 Bad Gateway")
+}

@@ -1,0 +1,61 @@
+// pingbot: answers /ping and "!ping". Run it with the bot's token in
+// DISCORD_TOKEN, and a server's id in GUILD_ID to register /ping there at
+// once (without it, /ping is registered in every server, which takes up
+// to an hour to show):
+//
+//     cd examples/pingbot
+//     nx fetch
+//     DISCORD_TOKEN=... GUILD_ID=... nx run main.nx
+//
+// "!ping" needs the Message Content intent switched on in the Developer
+// Portal (Bot tab); /ping needs nothing.
+
+import std.json
+import discord
+import discord.command
+import discord.interaction
+
+fn main() -> !void {
+    var tls = discord.layers() catch |e| {
+        eprintln("no trusted roots found; set SSL_CERT_FILE to a PEM bundle", .{})
+        return e
+    }
+    var bot = discord.from_env(&mut tls, discord.GUILDS | discord.GUILD_MESSAGES | discord.MESSAGE_CONTENT) catch |e| {
+        eprintln("set DISCORD_TOKEN to the bot's token (Developer Portal, Bot tab)", .{})
+        return e
+    }
+    while true {
+        let ev = bot.next() catch |e| {
+            eprintln("{}", .{bot.problem})
+            return e
+        }
+        match ev {
+            .Ready(r) => {
+                println("logged in as {} in {} servers", .{r.user.name, r.guilds.len})
+                var defs = List(json.Json).new()
+                defs.append(command.command("ping", "Is the bot there?"))
+                let guild = os.env("GUILD_ID") orelse ""
+                bot.register(guild, &defs) catch {
+                    eprintln("registering /ping: {}", .{bot.problem})
+                }
+            }
+            .MessageCreate(m) => {
+                if m.content == "!ping" and !m.author.bot {
+                    _ = bot.send(m.channel_id[..], "pong") catch {
+                        eprintln("{}", .{bot.problem})
+                        String.new()
+                    }
+                }
+            }
+            .InteractionCreate(ix) => {
+                if ix.command == "ping" {
+                    let reply = interaction.reply_text("pong")
+                    bot.respond(&ix, reply[..]) catch {
+                        eprintln("{}", .{bot.problem})
+                    }
+                }
+            }
+            else => { }
+        }
+    }
+}

@@ -1,0 +1,185 @@
+// event.nx: what the gateway tells a bot, as values to `match` on.
+//
+//     let ev = try bot.next()
+//     match ev {
+//         .MessageCreate(m) => { if m.content == "!ping" { _ = try bot.send(m.channel_id[..], "pong") } }
+//         .InteractionCreate(ix) => { ... }
+//         .Ready(r) => { println("logged in as {}", .{r.user.name}) }
+//         else => { }
+//     }
+//
+// The events with a variant of their own are the ones most bots use; every
+// other dispatch arrives as `Other`, with its name and its JSON to read with
+// std.json. A message's text needs the MESSAGE_CONTENT intent, except in a
+// direct message and a message that mentions the bot.
+
+import std.json
+import js
+import interaction
+
+/// Someone on Discord, as an event names them.
+pub struct User {
+    id: String
+    /// the display name: the global one, else the username
+    name: String
+    bot: bool
+}
+
+/// The session began (READY).
+pub struct Ready {
+    user: User
+    application_id: String
+    session_id: String
+    /// the servers the bot is in; each is told of by a GuildCreate soon
+    guilds: List(String)
+}
+
+/// A message someone sent (MESSAGE_CREATE).
+pub struct Received {
+    id: String
+    channel_id: String
+    /// empty in a direct message
+    guild_id: String
+    author: User
+    content: String
+    /// the ids of the users it mentions
+    mentions: List(String)
+}
+
+/// A server the bot is in, or joined (GUILD_CREATE).
+pub struct Guild {
+    id: String
+    name: String
+    member_count: i64
+}
+
+/// A reaction added to a message (MESSAGE_REACTION_ADD).
+pub struct Reaction {
+    user_id: String
+    channel_id: String
+    message_id: String
+    guild_id: String
+    /// the emoji as `Bot.react` takes it: a Unicode emoji, or name:id for a
+    /// server's own
+    emoji: String
+}
+
+/// Any other dispatch: its name (`t`) and its JSON.
+pub struct Raw {
+    name: String
+    json: String
+}
+
+pub enum Event {
+    Ready(Ready),
+    Resumed,
+    MessageCreate(Received),
+    InteractionCreate(interaction.Interaction),
+    GuildCreate(Guild),
+    ReactionAdd(Reaction),
+    Other(Raw),
+}
+
+fn user_of(u: *json.Json) -> User {
+    var name = String.from(js.str(u, "global_name"))
+    if name.len == 0 { name = String.from(js.str(u, "username")) }
+    return User{ .id = String.from(js.str(u, "id")), .name = name, .bot = js.flag(u, "bot") }
+}
+
+fn other(name: []u8, raw: []u8) -> Event {
+    return .Other(Raw{ .name = String.from(name), .json = String.from(raw) })
+}
+
+/// The event a dispatch is: `name` its `t`, `raw` the whole payload.
+pub fn parse(name: []u8, raw: []u8) -> Event {
+    let v = json.parse(raw) catch { return other(name, raw) }
+    if name == "RESUMED" { return .Resumed }
+    let d = json.get(&v, "d") orelse return other(name, raw)
+    if name == "READY" {
+        var guilds = List(String).new()
+        if let list = json.get(d, "guilds") {
+            for i in 0..json.len(list) {
+                if let g = json.at(list, i) { guilds.append(String.from(js.str(g, "id"))) }
+            }
+        }
+        var app = String.new()
+        if let a = json.get(d, "application") { app = String.from(js.str(a, "id")) }
+        var user = User{ .id = String.new(), .name = String.new(), .bot = true }
+        if let u = json.get(d, "user") { user = user_of(u) }
+        return .Ready(Ready{ .user = user, .application_id = app, .session_id = String.from(js.str(d, "session_id")), .guilds = guilds })
+    }
+    if name == "MESSAGE_CREATE" {
+        var author = User{ .id = String.new(), .name = String.new(), .bot = false }
+        if let u = json.get(d, "author") { author = user_of(u) }
+        var mentions = List(String).new()
+        if let list = json.get(d, "mentions") {
+            for i in 0..json.len(list) {
+                if let m = json.at(list, i) { mentions.append(String.from(js.str(m, "id"))) }
+            }
+        }
+        return .MessageCreate(Received{ .id = String.from(js.str(d, "id")), .channel_id = String.from(js.str(d, "channel_id")), .guild_id = String.from(js.str(d, "guild_id")), .author = author, .content = String.from(js.str(d, "content")), .mentions = mentions })
+    }
+    if name == "INTERACTION_CREATE" {
+        return .InteractionCreate(interaction.parse(d))
+    }
+    if name == "GUILD_CREATE" {
+        return .GuildCreate(Guild{ .id = String.from(js.str(d, "id")), .name = String.from(js.str(d, "name")), .member_count = js.int(d, "member_count", 0) })
+    }
+    if name == "MESSAGE_REACTION_ADD" {
+        var emoji = String.new()
+        if let e = json.get(d, "emoji") {
+            emoji = String.from(js.str(e, "name"))
+            let id = js.str(e, "id")
+            if id.len > 0 { emoji = format("{}:{}", .{emoji, id}) }
+        }
+        return .ReactionAdd(Reaction{ .user_id = String.from(js.str(d, "user_id")), .channel_id = String.from(js.str(d, "channel_id")), .message_id = String.from(js.str(d, "message_id")), .guild_id = String.from(js.str(d, "guild_id")), .emoji = emoji })
+    }
+    return other(name, raw)
+}
+
+// ------------------------------------------------------------------ tests
+
+test "the events a bot matches on" {
+    let ready = parse("READY", "{\"op\":0,\"s\":1,\"t\":\"READY\",\"d\":{\"session_id\":\"s1\",\"user\":{\"id\":\"42\",\"username\":\"helper\",\"bot\":true},\"application\":{\"id\":\"42\"},\"guilds\":[{\"id\":\"7\",\"unavailable\":true},{\"id\":\"8\",\"unavailable\":true}]}}")
+    match ready {
+        .Ready(r) => {
+            expect_eq(r.user.name, "helper")
+            expect(r.user.bot)
+            expect_eq(r.application_id, "42")
+            expect_eq(r.guilds.len, 2)
+        }
+        else => { expect(false) }
+    }
+    let m = parse("MESSAGE_CREATE", "{\"op\":0,\"s\":2,\"t\":\"MESSAGE_CREATE\",\"d\":{\"id\":\"100\",\"channel_id\":\"200\",\"guild_id\":\"7\",\"author\":{\"id\":\"9\",\"username\":\"sam\",\"global_name\":\"Sam\"},\"content\":\"!ping\",\"mentions\":[{\"id\":\"42\"}]}}")
+    match m {
+        .MessageCreate(msg) => {
+            expect_eq(msg.content, "!ping")
+            expect_eq(msg.channel_id, "200")
+            expect_eq(msg.author.name, "Sam")
+            expect(!msg.author.bot)
+            expect_eq(msg.mentions[0], "42")
+        }
+        else => { expect(false) }
+    }
+    let ix = parse("INTERACTION_CREATE", "{\"op\":0,\"s\":3,\"t\":\"INTERACTION_CREATE\",\"d\":{\"type\":2,\"id\":\"5\",\"token\":\"t\",\"data\":{\"name\":\"ping\"}}}")
+    match ix {
+        .InteractionCreate(i) => { expect_eq(i.command, "ping") }
+        else => { expect(false) }
+    }
+    let r = parse("MESSAGE_REACTION_ADD", "{\"op\":0,\"t\":\"MESSAGE_REACTION_ADD\",\"d\":{\"user_id\":\"9\",\"channel_id\":\"200\",\"message_id\":\"100\",\"emoji\":{\"id\":\"555\",\"name\":\"party\"}}}")
+    match r {
+        .ReactionAdd(re) => { expect_eq(re.emoji, "party:555") }
+        else => { expect(false) }
+    }
+    match parse("RESUMED", "{\"op\":0,\"t\":\"RESUMED\",\"d\":null}") {
+        .Resumed => { }
+        else => { expect(false) }
+    }
+    match parse("TYPING_START", "{\"op\":0,\"t\":\"TYPING_START\",\"d\":{\"user_id\":\"9\"}}") {
+        .Other(o) => {
+            expect_eq(o.name, "TYPING_START")
+            expect(o.json.find("\"user_id\":\"9\"") != null)
+        }
+        else => { expect(false) }
+    }
+}

@@ -1,0 +1,72 @@
+# CI: every push and pull request. Nexium 1.4 is not released yet, so the
+# compiler is built from a pinned commit of Londopy/nexium, from that
+# commit's own seed; the tests then run on Linux and macOS (nxtls reads
+# /dev/urandom, which Windows lacks until it moves to random.secure), the
+# sources are checked for formatting, and the example bot is checked.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # std.websocket and std.http's TLS slot with set_timeout (2026-09-25)
+  NEXIUM_COMMIT: 77507920bc19a82bc1e68a01a86b4fbcc53ba921
+  ZIG_VERSION: "0.14.1"
+  NX_NO_UPDATE_CHECK: "1"
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out Nexium at the pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Londopy/nexium
+          ref: ${{ env.NEXIUM_COMMIT }}
+          path: .nexium
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build nx from the seed
+        working-directory: .nexium
+        run: sh bootstrap/build.sh
+
+      - name: Fetch the dependencies
+        run: .nexium/nx-out/bootstrap/nx2 fetch
+
+      - name: Tests
+        run: |
+          for m in js gateway message interaction command event lib; do
+            .nexium/nx-out/bootstrap/nx2 test src/$m.nx --out-dir nx-out/t-$m
+          done
+
+      - name: Formatting
+        run: .nexium/nx-out/bootstrap/nx2 fmt src/*.nx examples/pingbot/main.nx --check
+
+      - name: The example bot checks
+        working-directory: examples/pingbot
+        run: |
+          ../../.nexium/nx-out/bootstrap/nx2 fetch
+          ../../.nexium/nx-out/bootstrap/nx2 check main.nx

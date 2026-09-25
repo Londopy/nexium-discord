@@ -1,0 +1,361 @@
+// interaction.nx: what a member does with the bot (a slash command, a
+// button pressed, a menu choice, a form sent, an option being typed), read
+// from Discord's JSON, and the answers Discord takes.
+//
+//     .InteractionCreate(ix) => {
+//         if ix.command == "roll" {
+//             let sides = ix.opt("sides") orelse "6"
+//             try bot.respond(&ix, interaction.reply_text(format("rolled a {}", .{...})[..]))
+//         }
+//     }
+//
+// An interaction must be answered within three seconds: `deferred` says
+// the bot is working on it, and `Bot.followup` or `Bot.edit_reply` bring
+// the real answer later.
+
+import std.json
+import js
+import message
+
+// interaction types
+pub const PING: i64 = 1
+pub const COMMAND: i64 = 2
+pub const COMPONENT: i64 = 3
+pub const AUTOCOMPLETE: i64 = 4
+pub const MODAL_SUBMIT: i64 = 5
+
+pub struct Opt {
+    name: String
+    value: String
+}
+
+pub struct Attachment {
+    id: String
+    filename: String
+    url: String
+    size: i64
+}
+
+/// What an interaction says, pulled out of its JSON.
+pub struct Interaction {
+    kind: i64
+    id: String
+    app_id: String
+    /// what the answer and follow-ups are sent with
+    token: String
+    guild_id: String
+    channel_id: String
+    user_id: String
+    user_name: String
+    /// the member's nickname in the server, when they have one
+    nick: String
+    roles: List(String)
+    /// slash command name, and its subcommand ("add", or "group sub")
+    command: String
+    sub: String
+    options: List(Opt)
+    /// the option being typed, for autocomplete
+    focused: String
+    /// button or select menu
+    custom_id: String
+    values: List(String)
+    /// the message a button was on
+    message_id: String
+    /// form fields: custom_id and what was typed
+    fields: List(Opt)
+    attachments: List(Attachment)
+}
+
+fn read_options(list: *json.Json, ix: *mut Interaction) {
+    for i in 0..json.len(list) {
+        let o = json.at(list, i) orelse continue
+        let t = js.int(o, "type", 0)
+        if t == 1 or t == 2 {
+            // a subcommand, or a group of them: go one level down
+            if ix.sub.len > 0 {
+                ix.sub.push_byte(' ')
+            }
+            ix.sub.append(js.str(o, "name"))
+            if let inner = json.get(o, "options") {
+                read_options(inner, ix)
+            }
+            continue
+        }
+        let value = if let v = json.get(o, "value") { js.text(v) } else { String.new() }
+        if js.flag(o, "focused") {
+            ix.focused = String.from(js.str(o, "name"))
+        }
+        ix.options.append(Opt{ .name = String.from(js.str(o, "name")), .value = value })
+    }
+}
+
+/// An interaction from Discord's JSON; fields it does not have are empty.
+pub fn parse(v: *json.Json) -> Interaction {
+    var ix = Interaction{
+        .kind = js.int(v, "type", 0),
+        .id = String.from(js.str(v, "id")),
+        .app_id = String.from(js.str(v, "application_id")),
+        .token = String.from(js.str(v, "token")),
+        .guild_id = String.from(js.str(v, "guild_id")),
+        .channel_id = String.from(js.str(v, "channel_id")),
+        .user_id = String.new(),
+        .user_name = String.new(),
+        .nick = String.new(),
+        .roles = List(String).new(),
+        .command = String.new(),
+        .sub = String.new(),
+        .options = List(Opt).new(),
+        .focused = String.new(),
+        .custom_id = String.new(),
+        .values = List(String).new(),
+        .message_id = String.new(),
+        .fields = List(Opt).new(),
+        .attachments = List(Attachment).new(),
+    }
+    // in a server the user is inside `member`, with the member's roles
+    if let member = json.get(v, "member") {
+        ix.roles = js.strings(member, "roles")
+        if let user = json.get(member, "user") {
+            ix.user_id = String.from(js.str(user, "id"))
+            ix.user_name = String.from(js.str(user, "global_name"))
+            if ix.user_name.len == 0 {
+                ix.user_name = String.from(js.str(user, "username"))
+            }
+        }
+        let nick = js.str(member, "nick")
+        if nick.len > 0 {
+            ix.user_name = String.from(nick)
+            ix.nick = String.from(nick)
+        }
+    } else if let user = json.get(v, "user") {
+        ix.user_id = String.from(js.str(user, "id"))
+        ix.user_name = String.from(js.str(user, "global_name"))
+        if ix.user_name.len == 0 {
+            ix.user_name = String.from(js.str(user, "username"))
+        }
+    }
+    if let msg = json.get(v, "message") {
+        ix.message_id = String.from(js.str(msg, "id"))
+    }
+    let data = json.get(v, "data") orelse return ix
+    ix.command = String.from(js.str(data, "name"))
+    ix.custom_id = String.from(js.str(data, "custom_id"))
+    ix.values = js.strings(data, "values")
+    if let opts = json.get(data, "options") {
+        read_options(opts, &mut ix)
+    }
+    if let rows = json.get(data, "components") {
+        for i in 0..json.len(rows) {
+            let row = json.at(rows, i) orelse continue
+            let comps = json.get(row, "components") orelse continue
+            for j in 0..json.len(comps) {
+                let c = json.at(comps, j) orelse continue
+                ix.fields.append(Opt{ .name = String.from(js.str(c, "custom_id")), .value = String.from(js.str(c, "value")) })
+            }
+        }
+    }
+    if let resolved = json.get(data, "resolved") {
+        if let atts = json.get(resolved, "attachments") {
+            for key in json.keys(atts) {
+                let a = json.get(atts, key) orelse continue
+                ix.attachments.append(Attachment{ .id = String.from(js.str(a, "id")), .filename = String.from(js.str(a, "filename")), .url = String.from(js.str(a, "url")), .size = js.int(a, "size", 0) })
+            }
+        }
+    }
+    return ix
+}
+
+impl Interaction {
+    /// A command option by name, or null.
+    pub fn opt(self: *Self, name: []u8) -> ?[]u8 {
+        for i in 0..self.options.len {
+            if self.options[i].name == name {
+                return self.options[i].value
+            }
+        }
+        return null
+    }
+
+    /// A form field by its custom_id; "" when absent.
+    pub fn field(self: *Self, id: []u8) -> []u8 {
+        for i in 0..self.fields.len {
+            if self.fields[i].name == id {
+                return self.fields[i].value
+            }
+        }
+        return ""
+    }
+
+    pub fn has_role(self: *Self, role: []u8) -> bool {
+        if role.len == 0 {
+            return false
+        }
+        for r in self.roles {
+            if r == role {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// ------------------------------------------------------------------ answers
+
+fn response(kind: i64, own data: json.Json) -> String {
+    var o = js.obj()
+    js.put_int(&mut o, "type", kind)
+    js.put(&mut o, "data", data)
+    return json.stringify(&o)
+}
+
+/// The answer to Discord's PING when it checks an interactions endpoint.
+pub fn pong() -> String {
+    return String.from("{\"type\":1}")
+}
+
+/// A new message in answer to a command or a button.
+pub fn reply(m: *message.Message) -> String {
+    return response(4, message.message_json(m))
+}
+
+/// A new message of text alone.
+pub fn reply_text(words: []u8) -> String {
+    let m = message.content(words)
+    return reply(&m)
+}
+
+/// "The bot is thinking": the real answer follows (`Bot.followup` or
+/// `Bot.edit_reply`), for work that may take longer than three seconds.
+pub fn deferred(ephemeral: bool) -> String {
+    var d = js.obj()
+    if ephemeral {
+        js.put_int(&mut d, "flags", 64)
+    }
+    return response(5, d)
+}
+
+/// The message a button was on, changed in place.
+pub fn update(m: *message.Message) -> String {
+    return response(7, message.message_json(m))
+}
+
+/// Opens a form.
+pub fn modal(f: *message.Form) -> String {
+    var d = js.obj()
+    js.put_str(&mut d, "custom_id", message.clip(f.custom_id, 100))
+    js.put_str(&mut d, "title", message.clip(f.title, 45))
+    var rows = json.array()
+    for input, i in f.inputs {
+        if i == 5 {
+            break
+        }
+        var box = js.obj()
+        js.put_int(&mut box, "type", 4)
+        js.put_str(&mut box, "custom_id", input.id)
+        js.put_str(&mut box, "label", message.clip(input.label, 45))
+        js.put_int(&mut box, "style", if input.long { 2 } else { 1 })
+        js.put_bool(&mut box, "required", input.required)
+        if input.max > 0 {
+            js.put_int(&mut box, "max_length", @min(input.max, 4000) as i64)
+        }
+        if input.value.len > 0 {
+            js.put_str(&mut box, "value", message.clip(input.value, 4000))
+        }
+        if input.placeholder.len > 0 {
+            js.put_str(&mut box, "placeholder", message.clip(input.placeholder, 100))
+        }
+        var row = js.obj()
+        js.put_int(&mut row, "type", 1)
+        var comps = json.array()
+        json.push(&mut comps, box)
+        js.put(&mut row, "components", comps)
+        json.push(&mut rows, row)
+    }
+    js.put(&mut d, "components", rows)
+    return response(9, d)
+}
+
+/// Autocomplete suggestions: (name shown, value sent), at most 25.
+pub fn choices(list: *List((String, String))) -> String {
+    var d = js.obj()
+    var arr = json.array()
+    for c, i in list.* {
+        if i == 25 {
+            break
+        }
+        var co = js.obj()
+        js.put_str(&mut co, "name", message.clip(c.0, 100))
+        js.put_str(&mut co, "value", message.clip(c.1, 100))
+        json.push(&mut arr, co)
+    }
+    js.put(&mut d, "choices", arr)
+    return response(8, d)
+}
+
+// ------------------------------------------------------------------ tests
+
+fn parse_text(t: []u8) -> Interaction {
+    let v = json.parse(t) catch {
+        panic("test JSON")
+    }
+    return parse(&v)
+}
+
+test "a slash command with a subcommand and options" {
+    let ix = parse_text("{\"type\":2,\"id\":\"1\",\"application_id\":\"9\",\"token\":\"tok\",\"guild_id\":\"5\",\"member\":{\"roles\":[\"77\"],\"nick\":null,\"user\":{\"id\":\"111\",\"username\":\"sam\",\"global_name\":\"Sam\"}},\"data\":{\"name\":\"tasks\",\"options\":[{\"name\":\"add\",\"type\":1,\"options\":[{\"name\":\"due\",\"type\":3,\"value\":\"2026-10-08\"},{\"name\":\"count\",\"type\":4,\"value\":3}]}]}}")
+    expect_eq(ix.kind, COMMAND)
+    expect_eq(ix.command, "tasks")
+    expect_eq(ix.sub, "add")
+    expect_eq(ix.opt("due").?, "2026-10-08")
+    expect_eq(ix.opt("count").?, "3")
+    expect(ix.opt("nope") == null)
+    expect_eq(ix.user_id, "111")
+    expect_eq(ix.user_name, "Sam")
+    expect(ix.has_role("77"))
+    expect(!ix.has_role("78"))
+    expect(!ix.has_role(""))
+    expect_eq(ix.token, "tok")
+    expect_eq(ix.app_id, "9")
+}
+
+test "a button press, a select menu, a submitted form, a DM" {
+    let b = parse_text("{\"type\":3,\"member\":{\"roles\":[],\"user\":{\"id\":\"2\",\"username\":\"a\"}},\"message\":{\"id\":\"555\"},\"data\":{\"custom_id\":\"vote:yes\",\"component_type\":2}}")
+    expect_eq(b.custom_id, "vote:yes")
+    expect_eq(b.message_id, "555")
+    let s = parse_text("{\"type\":3,\"data\":{\"custom_id\":\"size\",\"component_type\":3,\"values\":[\"large\"]}}")
+    expect_eq(s.values[0], "large")
+    let f = parse_text("{\"type\":5,\"data\":{\"custom_id\":\"feedback\",\"components\":[{\"type\":1,\"components\":[{\"type\":4,\"custom_id\":\"title\",\"value\":\"It works\"}]},{\"type\":1,\"components\":[{\"type\":4,\"custom_id\":\"body\",\"value\":\"line one\\nline two\"}]}]}}")
+    expect_eq(f.field("title"), "It works")
+    expect_eq(f.field("body"), "line one\nline two")
+    expect_eq(f.field("missing"), "")
+    // outside a server, the user comes without `member`
+    let dm = parse_text("{\"type\":2,\"user\":{\"id\":\"3\",\"username\":\"lee\",\"global_name\":\"Lee\"},\"data\":{\"name\":\"ping\"}}")
+    expect_eq(dm.user_id, "3")
+    expect_eq(dm.user_name, "Lee")
+}
+
+test "attachments and autocomplete" {
+    let a = parse_text("{\"type\":2,\"data\":{\"name\":\"import\",\"options\":[{\"name\":\"file\",\"type\":11,\"value\":\"99\"}],\"resolved\":{\"attachments\":{\"99\":{\"id\":\"99\",\"filename\":\"data.csv\",\"url\":\"https://cdn.discordapp.com/x.csv\",\"size\":1234}}}}}")
+    expect_eq(a.attachments.len, 1)
+    expect_eq(a.attachments[0].filename, "data.csv")
+    expect_eq(a.opt("file").?, "99")
+    let q = parse_text("{\"type\":4,\"data\":{\"name\":\"lookup\",\"options\":[{\"name\":\"term\",\"type\":3,\"value\":\"ab\",\"focused\":true}]}}")
+    expect_eq(q.focused, "term")
+}
+
+test "answers" {
+    expect_eq(pong(), "{\"type\":1}")
+    let r = reply_text("pong")
+    expect(r.starts_with("{\"type\":4,\"data\":{\"content\":\"pong\""))
+    expect(r.find("\"allowed_mentions\":{\"parse\":[]}") != null)
+    expect_eq(deferred(true), "{\"type\":5,\"data\":{\"flags\":64}}")
+    var f = message.form("feedback", "Tell us")
+    f.input("title", "Title", false, "", "", true, 80)
+    f.input("body", "What happened", true, "", "Steps, what you saw", false, 2000)
+    let m = modal(&f)
+    expect(m.starts_with("{\"type\":9,\"data\":{\"custom_id\":\"feedback\""))
+    expect(m.find("\"style\":2") != null)
+    var sugg = List((String, String)).new()
+    sugg.append((String.from("Apples"), String.from("apple")))
+    expect_eq(choices(&sugg), "{\"type\":8,\"data\":{\"choices\":[{\"name\":\"Apples\",\"value\":\"apple\"}]}}")
+}

@@ -1,0 +1,2 @@
+# nexium.lock: dependency	source	tag	commit (written by `nx fetch`)
+nxtls	https://github.com/Londopy/nxtls	v0.4.0	079ab6ff3a236f2d7bd3f7b898da38fb5a8915ba

@@ -1,0 +1,379 @@
+// message.nx: messages as Discord takes them, built from parts: text,
+// embeds, rows of buttons or a select menu, and forms (modals).
+//
+//     var m = message.message()
+//     m.content = String.from("The build is green")
+//     var e = message.embed("Build 142", "All 1,204 tests passed", 0x2ecc71)
+//     e.field("Took", "3m 12s", true)
+//     m.embeds.append(e)
+//     var row = message.buttons()
+//     row.buttons.append(message.link_button("Open the run", url))
+//     m.rows.append(row)
+//
+// Every message sets allowed_mentions, so it pings no one unless it names
+// the role or user on purpose (`ping_roles`, `ping_users`). Text is
+// clipped to Discord's limits once, here, so no message is built that
+// Discord would refuse.
+
+import std.json
+import std.text
+import js
+
+// button styles
+pub const PRIMARY: i64 = 1
+pub const SECONDARY: i64 = 2
+pub const SUCCESS: i64 = 3
+pub const DANGER: i64 = 4
+pub const LINK: i64 = 5
+
+pub struct Field {
+    name: String
+    value: String
+    inline: bool
+}
+
+pub struct Embed {
+    title: String
+    description: String
+    color: u32
+    fields: List(Field)
+    footer: String
+    /// a picture under the embed: a URL, or attachment://name.png for a
+    /// file sent with the same message
+    image: String
+    /// a link the title opens
+    url: String
+}
+
+pub struct Button {
+    label: String
+    style: i64
+    /// the custom_id, or the URL of a LINK button
+    target: String
+    disabled: bool
+}
+
+pub struct Choice {
+    label: String
+    value: String
+    description: String
+    chosen: bool
+}
+
+pub struct Menu {
+    custom_id: String
+    placeholder: String
+    choices: List(Choice)
+}
+
+/// One row: up to five buttons, or one select menu.
+pub struct Row {
+    buttons: List(Button)
+    menu: ?Menu
+}
+
+pub struct Message {
+    content: String
+    embeds: List(Embed)
+    rows: List(Row)
+    /// only the person who used the command sees it (in an interaction's
+    /// answer)
+    ephemeral: bool
+    /// the roles this message may ping; none by default
+    ping_roles: List(String)
+    /// the users it may ping; none by default
+    ping_users: List(String)
+}
+
+/// One text box of a form (a modal).
+pub struct Input {
+    id: String
+    label: String
+    /// a paragraph box rather than one line
+    long: bool
+    value: String
+    placeholder: String
+    required: bool
+    max: usize
+}
+
+pub struct Form {
+    custom_id: String
+    title: String
+    inputs: List(Input)
+}
+
+// ------------------------------------------------------------------ building
+
+pub fn message() -> Message {
+    return Message{ .content = String.new(), .embeds = List(Embed).new(), .rows = List(Row).new(), .ephemeral = false, .ping_roles = List(String).new(), .ping_users = List(String).new() }
+}
+
+/// A message of text alone.
+pub fn content(words: []u8) -> Message {
+    var m = message()
+    m.content = String.from(words)
+    return m
+}
+
+/// A message only the person who asked will see.
+pub fn private(own e: Embed) -> Message {
+    var m = message()
+    m.ephemeral = true
+    m.embeds.append(e)
+    return m
+}
+
+pub fn embed(title: []u8, description: []u8, color: u32) -> Embed {
+    return Embed{ .title = String.from(title), .description = String.from(description), .color = color, .fields = List(Field).new(), .footer = String.new(), .image = String.new(), .url = String.new() }
+}
+
+impl Embed {
+    pub fn field(self: *mut Self, name: []u8, value: []u8, inline: bool) {
+        self.fields.append(Field{ .name = String.from(name), .value = String.from(value), .inline = inline })
+    }
+}
+
+pub fn button(label: []u8, style: i64, custom_id: []u8) -> Button {
+    return Button{ .label = String.from(label), .style = style, .target = String.from(custom_id), .disabled = false }
+}
+
+pub fn link_button(label: []u8, url: []u8) -> Button {
+    return Button{ .label = String.from(label), .style = LINK, .target = String.from(url), .disabled = false }
+}
+
+pub fn buttons() -> Row {
+    return Row{ .buttons = List(Button).new(), .menu = null }
+}
+
+pub fn menu_row(own m: Menu) -> Row {
+    return Row{ .buttons = List(Button).new(), .menu = m }
+}
+
+pub fn menu(custom_id: []u8, placeholder: []u8) -> Menu {
+    return Menu{ .custom_id = String.from(custom_id), .placeholder = String.from(placeholder), .choices = List(Choice).new() }
+}
+
+impl Menu {
+    pub fn choice(self: *mut Self, label: []u8, value: []u8, description: []u8, chosen: bool) {
+        self.choices.append(Choice{ .label = String.from(label), .value = String.from(value), .description = String.from(description), .chosen = chosen })
+    }
+}
+
+pub fn form(custom_id: []u8, title: []u8) -> Form {
+    return Form{ .custom_id = String.from(custom_id), .title = String.from(title), .inputs = List(Input).new() }
+}
+
+impl Form {
+    pub fn input(self: *mut Self, id: []u8, label: []u8, long: bool, value: []u8, placeholder: []u8, required: bool, max: usize) {
+        self.inputs.append(Input{ .id = String.from(id), .label = String.from(label), .long = long, .value = String.from(value), .placeholder = String.from(placeholder), .required = required, .max = max })
+    }
+}
+
+/// <@123>: a mention that shows a clickable name. It notifies only when
+/// the message's `ping_users` names the user.
+pub fn user_mention(id: []u8) -> String {
+    return format("<@{}>", .{id})
+}
+
+pub fn role_mention(id: []u8) -> String {
+    return format("<@&{}>", .{id})
+}
+
+pub fn channel_mention(id: []u8) -> String {
+    return format("<#{}>", .{id})
+}
+
+// ------------------------------------------------------------------ JSON
+
+/// At most `n` characters of `s`, ending in "..." when cut.
+pub fn clip(s: []u8, n: usize) -> String {
+    if text.char_count(s) <= n {
+        return String.from(s)
+    }
+    var out = String.from(text.truncate(s, n - 3))
+    out.append("...")
+    return out
+}
+
+fn embed_json(e: *Embed) -> json.Json {
+    var o = js.obj()
+    if e.title.len > 0 {
+        js.put_str(&mut o, "title", clip(e.title, 256))
+    }
+    if e.description.len > 0 {
+        js.put_str(&mut o, "description", clip(e.description, 4096))
+    }
+    if e.url.len > 0 {
+        js.put_str(&mut o, "url", e.url)
+    }
+    js.put_int(&mut o, "color", e.color as i64)
+    if e.fields.len > 0 {
+        var fields = json.array()
+        for f, i in e.fields {
+            if i == 25 {
+                break
+            }
+            var fo = js.obj()
+            js.put_str(&mut fo, "name", clip(f.name, 256))
+            js.put_str(&mut fo, "value", clip(f.value, 1024))
+            js.put_bool(&mut fo, "inline", f.inline)
+            json.push(&mut fields, fo)
+        }
+        js.put(&mut o, "fields", fields)
+    }
+    if e.footer.len > 0 {
+        var fo = js.obj()
+        js.put_str(&mut fo, "text", clip(e.footer, 2048))
+        js.put(&mut o, "footer", fo)
+    }
+    if e.image.len > 0 {
+        var io = js.obj()
+        js.put_str(&mut io, "url", e.image)
+        js.put(&mut o, "image", io)
+    }
+    return o
+}
+
+fn button_json(b: *Button) -> json.Json {
+    var o = js.obj()
+    js.put_int(&mut o, "type", 2)
+    js.put_int(&mut o, "style", b.style)
+    js.put_str(&mut o, "label", clip(b.label, 80))
+    if b.style == LINK {
+        js.put_str(&mut o, "url", b.target)
+    } else {
+        js.put_str(&mut o, "custom_id", clip(b.target, 100))
+    }
+    if b.disabled {
+        js.put_bool(&mut o, "disabled", true)
+    }
+    return o
+}
+
+fn row_json(r: *Row) -> json.Json {
+    var o = js.obj()
+    js.put_int(&mut o, "type", 1)
+    var items = json.array()
+    if let m = r.menu {
+        var mo = js.obj()
+        js.put_int(&mut mo, "type", 3)
+        js.put_str(&mut mo, "custom_id", clip(m.custom_id, 100))
+        js.put_str(&mut mo, "placeholder", clip(m.placeholder, 150))
+        var opts = json.array()
+        for c, i in m.choices {
+            if i == 25 {
+                break
+            }
+            var co = js.obj()
+            js.put_str(&mut co, "label", clip(c.label, 100))
+            js.put_str(&mut co, "value", clip(c.value, 100))
+            if c.description.len > 0 {
+                js.put_str(&mut co, "description", clip(c.description, 100))
+            }
+            if c.chosen {
+                js.put_bool(&mut co, "default", true)
+            }
+            json.push(&mut opts, co)
+        }
+        js.put(&mut mo, "options", opts)
+        json.push(&mut items, mo)
+    } else {
+        for b, i in r.buttons {
+            if i == 5 {
+                break
+            }
+            json.push(&mut items, button_json(&b))
+        }
+    }
+    js.put(&mut o, "components", items)
+    return o
+}
+
+/// A message as Discord takes it, posted to a channel or in an
+/// interaction's answer.
+pub fn message_json(m: *Message) -> json.Json {
+    var o = js.obj()
+    js.put_str(&mut o, "content", clip(m.content, 2000))
+    var embeds = json.array()
+    for e, i in m.embeds {
+        if i == 10 {
+            break
+        }
+        json.push(&mut embeds, embed_json(&e))
+    }
+    js.put(&mut o, "embeds", embeds)
+    var rows = json.array()
+    for r, i in m.rows {
+        if i == 5 {
+            break
+        }
+        json.push(&mut rows, row_json(&r))
+    }
+    js.put(&mut o, "components", rows)
+    if m.ephemeral {
+        js.put_int(&mut o, "flags", 64)
+    }
+    var mentions = js.obj()
+    js.put(&mut mentions, "parse", json.array())
+    if m.ping_users.len > 0 {
+        js.put(&mut mentions, "users", js.string_array(m.ping_users))
+    }
+    if m.ping_roles.len > 0 {
+        js.put(&mut mentions, "roles", js.string_array(m.ping_roles))
+    }
+    js.put(&mut o, "allowed_mentions", mentions)
+    return o
+}
+
+/// A message as JSON text.
+pub fn to_json(m: *Message) -> String {
+    let j = message_json(m)
+    return json.stringify(&j)
+}
+
+// ------------------------------------------------------------------ tests
+
+test "messages: no pings unless named, limits enforced" {
+    var e = embed("Build 142", "All 1,204 tests passed", 0x2ecc71)
+    e.field("Took", "3m 12s", true)
+    e.footer = String.from("ci.example.org")
+    var m = private(e)
+    var row = buttons()
+    row.buttons.append(button("Run again", SUCCESS, "rerun:142"))
+    row.buttons.append(link_button("Open the run", "https://ci.example.org/runs/142"))
+    m.rows.append(row)
+    let j = to_json(&m)
+    expect(j.starts_with("{\"content\":\"\",\"embeds\":[{\"title\":\"Build 142\""))
+    expect(j.find("\"flags\":64") != null)
+    expect(j.find("\"allowed_mentions\":{\"parse\":[]}") != null)
+    expect(j.find("\"url\":\"https://ci.example.org/runs/142\"") != null)
+    expect(j.find("\"custom_id\":\"rerun:142\"") != null)
+    var ping = content(format("{} the deploy is done", .{role_mention("42")})[..])
+    ping.ping_roles.append(String.from("42"))
+    expect(to_json(&ping).find("\"allowed_mentions\":{\"parse\":[],\"roles\":[\"42\"]}") != null)
+    var long = String.new()
+    for _ in 0..300 {
+        long.append("ab")
+    }
+    expect_eq(text.char_count(clip(long, 256)), 256)
+    expect(clip(long, 256).ends_with("..."))
+    expect_eq(user_mention("7"), "<@7>")
+    expect_eq(channel_mention("8"), "<#8>")
+}
+
+test "a select menu, and past Discord's counts" {
+    var mn = menu("pick", "Choose one")
+    mn.choice("Red", "r", "", false)
+    mn.choice("Blue", "b", "the calm one", true)
+    var m = message()
+    m.rows.append(menu_row(mn))
+    let j = to_json(&m)
+    expect(j.find("\"type\":3,\"custom_id\":\"pick\"") != null)
+    expect(j.find("\"default\":true") != null)
+    // eleven embeds: ten are sent
+    var many = message()
+    for _ in 0..11 { many.embeds.append(embed("e", "", 0)) }
+    let v = json.parse(to_json(&many)[..]) catch { panic("json") }
+    expect_eq(json.len(json.get(&v, "embeds").?), 10)
+}

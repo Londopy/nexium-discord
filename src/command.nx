@@ -1,0 +1,138 @@
+// command.nx: slash command definitions, the JSON Discord registers
+// (`Bot.register`).
+//
+//     var roll = command.command("roll", "Roll a die")
+//     command.add(&mut roll, command.option(command.INTEGER, "sides", "How many sides", false))
+//     var defs = List(json.Json).new()
+//     defs.append(roll)
+//     try bot.register("", &defs)          // every server; a server's id for that one
+//
+// A subcommand is a `sub` with options of its own, `add`ed to its command.
+
+import std.json
+import js
+
+// option types
+pub const SUB: i64 = 1
+pub const GROUP: i64 = 2
+pub const STRING: i64 = 3
+pub const INTEGER: i64 = 4
+pub const BOOLEAN: i64 = 5
+pub const USER: i64 = 6
+pub const CHANNEL: i64 = 7
+pub const ROLE: i64 = 8
+pub const MENTIONABLE: i64 = 9
+pub const NUMBER: i64 = 10
+pub const ATTACHMENT: i64 = 11
+
+/// Permissions for `restrict`, as Discord writes them (a decimal string).
+pub const ADMINISTRATOR: []u8 = "8"
+pub const MANAGE_SERVER: []u8 = "32"
+pub const MANAGE_MESSAGES: []u8 = "8192"
+
+/// A command usable in servers and in direct messages with the bot.
+pub fn command(name: []u8, description: []u8) -> json.Json {
+    var o = js.obj()
+    js.put_str(&mut o, "name", name)
+    js.put_str(&mut o, "description", description)
+    js.put_int(&mut o, "type", 1)
+    js.put(&mut o, "options", json.array())
+    return o
+}
+
+/// A command usable in servers only.
+pub fn guild_command(name: []u8, description: []u8) -> json.Json {
+    var o = command(name, description)
+    var contexts = json.array()
+    json.push(&mut contexts, json.number(0.0))
+    js.put(&mut o, "contexts", contexts)
+    return o
+}
+
+/// Hides a command from members without `permissions` (`MANAGE_SERVER`),
+/// until a server's admin changes that in its settings.
+pub fn restrict(o: *mut json.Json, permissions: []u8) {
+    js.put_str(o, "default_member_permissions", permissions)
+}
+
+/// One option of a command or subcommand.
+pub fn option(kind: i64, name: []u8, description: []u8, required: bool) -> json.Json {
+    var o = js.obj()
+    js.put_int(&mut o, "type", kind)
+    js.put_str(&mut o, "name", name)
+    js.put_str(&mut o, "description", description)
+    if required {
+        js.put_bool(&mut o, "required", true)
+    }
+    return o
+}
+
+/// A string option offering fixed choices: (name shown, value sent).
+pub fn choice_option(name: []u8, description: []u8, required: bool, choices: *List((String, String))) -> json.Json {
+    var o = option(STRING, name, description, required)
+    var list = json.array()
+    for c in choices.* {
+        var co = js.obj()
+        js.put_str(&mut co, "name", c.0)
+        js.put_str(&mut co, "value", c.1)
+        json.push(&mut list, co)
+    }
+    js.put(&mut o, "choices", list)
+    return o
+}
+
+/// Makes a string option suggest as the member types: the bot answers
+/// AUTOCOMPLETE interactions with `interaction.choices`.
+pub fn autocomplete(o: *mut json.Json) {
+    js.put_bool(o, "autocomplete", true)
+}
+
+/// A subcommand; `add` its options to it, then `add` it to the command.
+pub fn sub(name: []u8, description: []u8) -> json.Json {
+    var o = option(SUB, name, description, false)
+    js.put(&mut o, "options", json.array())
+    return o
+}
+
+/// A group of subcommands.
+pub fn group(name: []u8, description: []u8) -> json.Json {
+    var o = option(GROUP, name, description, false)
+    js.put(&mut o, "options", json.array())
+    return o
+}
+
+/// Adds an option (or a subcommand, or a group) to a command, a group or a
+/// subcommand.
+pub fn add(o: *mut json.Json, own opt: json.Json) {
+    if let list = json.get_mut(o, "options") {
+        json.push(list, opt)
+    }
+}
+
+// ------------------------------------------------------------------ tests
+
+test "a command with a subcommand, choices and a restriction" {
+    var tasks = guild_command("tasks", "The team's tasks")
+    restrict(&mut tasks, MANAGE_SERVER)
+    var add_sub = sub("add", "Add a task")
+    add(&mut add_sub, option(STRING, "title", "What to do", true))
+    var sizes = List((String, String)).new()
+    sizes.append((String.from("Small"), String.from("s")))
+    sizes.append((String.from("Large"), String.from("l")))
+    add(&mut add_sub, choice_option("size", "How big", false, &sizes))
+    add(&mut tasks, add_sub)
+    var look = option(STRING, "find", "Find a task", false)
+    autocomplete(&mut look)
+    var find_sub = sub("find", "Find one")
+    add(&mut find_sub, look)
+    add(&mut tasks, find_sub)
+    let j = json.stringify(&tasks)
+    expect(j.starts_with("{\"name\":\"tasks\",\"description\":\"The team's tasks\",\"type\":1,\"options\":[{\"type\":1,\"name\":\"add\""))
+    expect(j.find("\"contexts\":[0]") != null)
+    expect(j.find("\"default_member_permissions\":\"32\"") != null)
+    expect(j.find("\"choices\":[{\"name\":\"Small\",\"value\":\"s\"},{\"name\":\"Large\",\"value\":\"l\"}]") != null)
+    expect(j.find("\"autocomplete\":true") != null)
+    expect(j.find("\"required\":true") != null)
+    let plain = json.stringify(&command("ping", "Is the bot there?"))
+    expect_eq(plain, "{\"name\":\"ping\",\"description\":\"Is the bot there?\",\"type\":1,\"options\":[]}")
+}

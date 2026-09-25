@@ -1,0 +1,91 @@
+// layer.nx: nxtls in std.http's TLS slot, for the REST calls and the
+// gateway.
+//
+// A `Layer` holds one TLS connection at a time, so a bot has two: the
+// gateway's WebSocket stays open while REST calls come and go on the other
+// (`Layers`). Certificates are checked against the system's trusted roots.
+//
+// nxtls reads its randomness from /dev/urandom until it moves to Nexium
+// 1.4's `random.secure`, so for now a bot runs on Linux, macOS and the BSDs.
+
+import std.http
+import std.fs
+import std.time
+import nxtls.tls
+import nxtls.x509
+
+/// nxtls behind `http.Transport`.
+pub struct Layer {
+    roots: x509.Store
+    conn: tls.Conn
+    /// why the last connection failed or was refused, when it was
+    problem: String
+}
+
+/// A layer whose connections trust the certificates in `roots_pem` (a PEM
+/// bundle, as `system_roots` gives).
+pub fn layer(roots_pem: []u8) -> Layer {
+    return Layer{ .roots = x509.store_from_pem(roots_pem), .conn = tls.none(), .problem = String.new() }
+}
+
+impl http.Transport for Layer {
+    fn connect(self: *mut Self, host: []u8, port: u16, timeout_ms: i64) -> !void {
+        self.conn.close()
+        self.conn = tls.connect(host, port, &self.roots, time.now(), timeout_ms)
+        if !self.conn.is_open() {
+            self.problem = self.conn.problem.clone()
+            return error.ConnectionRefused
+        }
+        self.problem = String.new()
+    }
+
+    fn send(self: *mut Self, data: []u8) -> !void {
+        return self.conn.send(data)
+    }
+
+    fn recv(self: *mut Self) -> !String {
+        return self.conn.recv()
+    }
+
+    fn set_timeout(self: *mut Self, ms: i64) {
+        self.conn.set_timeout(ms)
+    }
+
+    fn truncated(self: *Self) -> bool {
+        return self.conn.truncated()
+    }
+
+    fn close(self: *mut Self) {
+        self.conn.close()
+    }
+}
+
+/// A bot's two layers: the REST calls' and the gateway's.
+pub struct Layers {
+    rest: Layer
+    gateway: Layer
+}
+
+// where the systems keep their bundle of trusted roots: Debian and Ubuntu,
+// Fedora and RHEL, openSUSE, macOS and the BSDs, FreeBSD's ports
+const BUNDLES = ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/ca-bundle.pem", "/etc/ssl/cert.pem", "/usr/local/share/certs/ca-root-nss.crt"]
+
+/// The system's trusted roots, as PEM: the file `$SSL_CERT_FILE` names,
+/// else the first bundle in the usual places. `error.NotFound` where there
+/// is none.
+pub fn system_roots() -> !String {
+    if let path = os.env("SSL_CERT_FILE") {
+        if path.len > 0 { return fs.read(path) }
+    }
+    for p in BUNDLES {
+        let pem = fs.read(p) catch { continue }
+        return pem
+    }
+    return error.NotFound
+}
+
+/// Two layers over the system's trusted roots.
+pub fn layers() -> !Layers {
+    let pem = try system_roots()
+    return Layers{ .rest = layer(pem[..]), .gateway = layer(pem[..]) }
+}

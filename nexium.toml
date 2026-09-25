@@ -1,0 +1,6 @@
+[package]
+name = "discord"
+version = "0.1.0"
+
+[dependencies]
+nxtls = { git = "https://github.com/Londopy/nxtls", tag = "v0.4.0" }
