@@ -1,12 +1,11 @@
-// layer.nx: nxtls in std.http's TLS slot, for the REST calls and the
-// gateway.
+// layer.nx: TLS in std.http's slot, for the REST calls and the gateway.
 //
 // A `Layer` holds one TLS connection at a time, so a bot has two: the
 // gateway's WebSocket stays open while REST calls come and go on the other
-// (`Layers`). Certificates are checked against the system's trusted roots.
-//
-// nxtls reads its randomness from /dev/urandom until it moves to Nexium
-// 1.4's `random.secure`, so for now a bot runs on Linux, macOS and the BSDs.
+// (`Layers`). The TLS is nxtls, over the system's trusted roots as a PEM
+// bundle; where the system keeps no bundle (Windows, unless
+// `$SSL_CERT_FILE` names one), it is the platform's own, std.http's
+// `SystemTls`, which checks certificates against the system's store.
 
 import std.http
 import std.fs
@@ -14,22 +13,41 @@ import std.time
 import nxtls.tls
 import nxtls.x509
 
-/// nxtls behind `http.Transport`.
+/// A TLS connection behind `http.Transport`: nxtls, or the platform's TLS.
 pub struct Layer {
     roots: x509.Store
     conn: tls.Conn
+    /// the platform's TLS, when `system` says so
+    platform: http.SystemTls
+    /// true when the connections are the platform's rather than nxtls's
+    system: bool
     /// why the last connection failed or was refused, when it was
     problem: String
 }
 
-/// A layer whose connections trust the certificates in `roots_pem` (a PEM
-/// bundle, as `system_roots` gives).
+/// A layer whose connections are nxtls's and trust the certificates in
+/// `roots_pem` (a PEM bundle, as `system_roots` gives).
 pub fn layer(roots_pem: []u8) -> Layer {
-    return Layer{ .roots = x509.store_from_pem(roots_pem), .conn = tls.none(), .problem = String.new() }
+    return Layer{ .roots = x509.store_from_pem(roots_pem), .conn = tls.none(), .platform = http.SystemTls.new(), .system = false, .problem = String.new() }
+}
+
+/// A layer whose connections are the platform's TLS: SChannel on Windows,
+/// Security.framework on macOS, OpenSSL's libssl elsewhere.
+pub fn system_layer() -> Layer {
+    return Layer{ .roots = x509.store_from_pem(""), .conn = tls.none(), .platform = http.SystemTls.new(), .system = true, .problem = String.new() }
 }
 
 impl http.Transport for Layer {
     fn connect(self: *mut Self, host: []u8, port: u16, timeout_ms: i64) -> !void {
+        if self.system {
+            // failures come back as nxtls's do: refused, with the reason
+            self.platform.connect(host, port, timeout_ms) catch {
+                self.problem = http.SystemTls.problem()
+                return error.ConnectionRefused
+            }
+            self.problem = String.new()
+            return
+        }
         self.conn.close()
         self.conn = tls.connect(host, port, &self.roots, time.now(), timeout_ms)
         if !self.conn.is_open() {
@@ -40,22 +58,33 @@ impl http.Transport for Layer {
     }
 
     fn send(self: *mut Self, data: []u8) -> !void {
+        if self.system { return self.platform.send(data) }
         return self.conn.send(data)
     }
 
     fn recv(self: *mut Self) -> !String {
+        if self.system { return self.platform.recv() }
         return self.conn.recv()
     }
 
     fn set_timeout(self: *mut Self, ms: i64) {
+        if self.system {
+            self.platform.set_timeout(ms)
+            return
+        }
         self.conn.set_timeout(ms)
     }
 
     fn truncated(self: *Self) -> bool {
+        if self.system { return self.platform.truncated() }
         return self.conn.truncated()
     }
 
     fn close(self: *mut Self) {
+        if self.system {
+            self.platform.close()
+            return
+        }
         self.conn.close()
     }
 }
@@ -72,7 +101,7 @@ const BUNDLES = ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bu
 
 /// The system's trusted roots, as PEM: the file `$SSL_CERT_FILE` names,
 /// else the first bundle in the usual places. `error.NotFound` where there
-/// is none.
+/// is none, as on Windows, which keeps them in a store instead.
 pub fn system_roots() -> !String {
     if let path = os.env("SSL_CERT_FILE") {
         if path.len > 0 { return fs.read(path) }
@@ -84,8 +113,37 @@ pub fn system_roots() -> !String {
     return error.NotFound
 }
 
-/// Two layers over the system's trusted roots.
+/// Two layers: nxtls over the system's trusted roots, or, where the system
+/// has no bundle of them for nxtls to read, the platform's TLS.
+/// `error.NotFound` when there is neither (a Linux with no bundle and no
+/// libssl).
 pub fn layers() -> !Layers {
-    let pem = try system_roots()
+    let pem = system_roots() catch |e| {
+        if http.SystemTls.available() { return system_layers() }
+        return e
+    }
     return Layers{ .rest = layer(pem[..]), .gateway = layer(pem[..]) }
+}
+
+/// Two layers over the platform's TLS, whatever bundles the system has.
+pub fn system_layers() -> Layers {
+    return Layers{ .rest = system_layer(), .gateway = system_layer() }
+}
+
+test "a layer is nxtls's or the platform's, as it was made" {
+    let n = layer("")
+    expect(!n.system)
+    let s = system_layer()
+    expect(s.system)
+    let both = system_layers()
+    expect(both.rest.system and both.gateway.system)
+}
+
+test "a closed layer of either kind reports no truncation" {
+    var n = layer("")
+    n.close()
+    expect(!n.truncated())
+    var s = system_layer()
+    s.close()
+    expect(!s.truncated())
 }

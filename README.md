@@ -3,7 +3,7 @@
 # nexium-discord
 
 **A Discord bot library for Nexium: the gateway, the REST calls a bot makes, and events to `match` on.**<br>
-Written in Nexium over `std.http` and `std.websocket`, with TLS from [nxtls](https://github.com/Londopy/nxtls).
+Written in Nexium over `std.http` and `std.websocket`, with TLS from [nxtls](https://github.com/Londopy/nxtls), or the system's own where there are no roots for nxtls to read.
 
 [![CI](https://github.com/Londopy/nexium-discord/actions/workflows/ci.yml/badge.svg)](https://github.com/Londopy/nexium-discord/actions/workflows/ci.yml)
 [![Written in Nexium](https://img.shields.io/badge/written%20in-Nexium-7C3AED)](https://github.com/Londopy/nexium)
@@ -26,11 +26,11 @@ command code come from a Discord bot that has run on them since September
 2026.
 
 > [!NOTE]
-> **Needs Nexium 1.4**, which is not released yet: build `nx` from
-> [Nexium's main branch](https://github.com/Londopy/nexium) until then.
-> **Linux, macOS and the BSDs for now**: nxtls reads its randomness from
-> /dev/urandom until it moves to Nexium 1.4's `random.secure`, which gives
-> it Windows too.
+> **Needs [Nexium](https://github.com/Londopy/nexium) 1.4.0** or later.
+> Runs on Linux, macOS, the BSDs and Windows. The TLS is nxtls, over the
+> system's trusted roots; Windows keeps those in a store rather than a
+> file, so a bot there uses the system's own TLS (SChannel), unless
+> `$SSL_CERT_FILE` names a PEM bundle for nxtls.
 
 ## Use
 
@@ -38,7 +38,7 @@ In your bot's `nexium.toml`, then `nx fetch`:
 
 ```toml
 [dependencies]
-discord = { git = "https://github.com/Londopy/nexium-discord", tag = "v0.1.0" }
+discord = { git = "https://github.com/Londopy/nexium-discord", tag = "v0.2.0" }
 ```
 
 A bot that answers `/ping` ([examples/pingbot](examples/pingbot/main.nx)
@@ -90,13 +90,13 @@ only to Discord, and never appears in `bot.problem`.
 | `discord.interaction` | slash commands (with subcommands and options), buttons, menu choices, submitted forms and autocomplete as they arrive, and the answers: `reply`, `reply_text`, `deferred`, `update`, `modal`, `choices` |
 | `discord.command` | slash command definitions: options of every type, fixed choices, subcommands and groups, autocomplete, commands only for servers, commands hidden from members without a permission |
 | `discord.gateway` | the Gateway protocol (v10, JSON) as a state machine with no socket in it: identify, heartbeats with the sequence, resume at `resume_gateway_url`, Reconnect and Invalid Session, a connection that stops acknowledging heartbeats, the close codes no retry fixes; every intent Discord has |
-| `discord.layer` | nxtls behind `std.http`'s `Transport`, over the system's trusted roots (`$SSL_CERT_FILE`, or the usual bundles) |
+| `discord.layer` | TLS behind `std.http`'s `Transport`: nxtls over the system's trusted roots (`$SSL_CERT_FILE`, or the usual bundles), or the platform's own where there is no bundle (Windows); `discord.system_layers()` takes the platform's everywhere |
 
 ## Tests
 
 ```sh
 nx fetch
-for m in js gateway message interaction command event lib; do nx test src/$m.nx; done
+for m in js gateway message interaction command event layer lib; do nx test src/$m.nx; done
 ```
 
 A scripted Discord plays through a transport of its own: a gateway
@@ -106,17 +106,17 @@ refusal's words in `problem`, slash commands registered. The gateway's
 state machine runs whole sessions on made-up clocks (a heartbeat never
 acknowledged, Invalid Session, every close code), and the messages,
 interactions and commands are read and written as Discord's JSON has
-them. Checked live from Linux, with no token that works: `GET /gateway`
-through nxtls, and the gateway's handshake, Hello and Identify, ending in
-Discord's close 4004 as `bot.problem` says it.
+them. Checked live from Linux and Windows, with no token that works:
+`GET /gateway`, and the gateway's handshake, Hello and Identify, ending in
+Discord's close 4004 as `bot.problem` says it; on Windows through both
+SChannel and nxtls.
 
 ## Status
 
-0.1.0 is a bot's everyday: messages, slash commands and their answers,
+0.2.0 is a bot's everyday: messages, slash commands and their answers,
 buttons, menus, forms, reactions. Not yet: sharding (a bot in more than
 2,500 servers), voice, the gateway's zlib compression, uploading files,
-and the rest of the REST API beyond `api`. Windows waits for nxtls on
-`random.secure`.
+and the rest of the REST API beyond `api`.
 
 ## License
 

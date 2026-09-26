@@ -1,12 +1,7 @@
-# CI: every push and pull request. Nexium 1.4 is not released yet, so the
-# compiler is built from a pinned commit of Londopy/nexium, from that
-# commit's own seed; the tests then run on Linux and macOS (nxtls reads
-# /dev/urandom, which Windows lacks until it moves to random.secure), the
-# sources are checked for formatting, and the example bot is checked.
-#
-# The package and Nexium are checked out side by side: inside the
-# package's directory, the compiler's build would find the package's
-# nexium.toml above it and ask for its dependencies.
+# CI: every push and pull request. The tests on Linux, Windows and macOS
+# against Nexium's release, the sources checked for formatting, and the
+# example bot checked. The tests talk to a scripted Discord, not the real
+# one: no token, no network.
 
 name: CI
 
@@ -22,9 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # std.websocket and std.http's TLS slot with set_timeout (2026-09-25)
-  NEXIUM_COMMIT: 77507920bc19a82bc1e68a01a86b4fbcc53ba921
-  ZIG_VERSION: "0.14.1"
+  NEXIUM_VERSION: v1.4.0
   NX_NO_UPDATE_CHECK: "1"
 
 jobs:
@@ -35,46 +28,34 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: pkg
           persist-credentials: false
 
-      - name: Check out Nexium at the pinned commit
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Londopy/nexium/.github/actions/setup-nexium@664f8ed46bd4c6b05c15cd665cedad51f9c60c34 # v1.4.0
         with:
-          repository: Londopy/nexium
-          ref: ${{ env.NEXIUM_COMMIT }}
-          path: nexium
-          persist-credentials: false
-
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: ${{ env.ZIG_VERSION }}
-
-      - name: Build nx from the seed
-        working-directory: nexium
-        run: sh bootstrap/build.sh
+          version: ${{ env.NEXIUM_VERSION }}
 
       - name: Fetch the dependencies
-        working-directory: pkg
-        run: "$GITHUB_WORKSPACE/nexium/nx-out/bootstrap/nx2 fetch"
+        shell: bash
+        run: nx fetch
 
       - name: Tests
-        working-directory: pkg
+        shell: bash
         run: |
-          for m in js gateway message interaction command event lib; do
-            "$GITHUB_WORKSPACE/nexium/nx-out/bootstrap/nx2" test src/$m.nx --out-dir nx-out/t-$m
+          for m in js gateway message interaction command event layer lib; do
+            nx test src/$m.nx --out-dir nx-out/t-$m
           done
 
       - name: Formatting
-        working-directory: pkg
-        run: "$GITHUB_WORKSPACE/nexium/nx-out/bootstrap/nx2 fmt src/*.nx examples/pingbot/main.nx --check"
+        if: runner.os == 'Linux'
+        run: nx fmt src/*.nx examples/pingbot/main.nx --check
 
       - name: The example bot checks
-        working-directory: pkg/examples/pingbot
+        shell: bash
+        working-directory: examples/pingbot
         run: |
-          "$GITHUB_WORKSPACE/nexium/nx-out/bootstrap/nx2" fetch
-          "$GITHUB_WORKSPACE/nexium/nx-out/bootstrap/nx2" check main.nx
+          nx fetch
+          nx check main.nx

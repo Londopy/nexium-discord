@@ -24,7 +24,8 @@
 // messages, embeds, buttons, menus, forms), `interaction` (slash commands
 // and buttons as they arrive, and the answers), `command` (slash command
 // definitions), `gateway` (the protocol, as a state machine), `layer`
-// (nxtls behind std.http's Transport). A call that fails for Discord's
+// (TLS behind std.http's Transport: nxtls, or the platform's where the
+// system has no bundle of roots for it). A call that fails for Discord's
 // reason says it in `bot.problem`; the token is never in it.
 
 import std.http
@@ -50,7 +51,7 @@ pub const MESSAGE_CONTENT: u64 = 32768
 pub const API: []u8 = "https://discord.com/api/v10"
 
 // Discord asks bots to name themselves this way
-const USER_AGENT: []u8 = "DiscordBot (https://github.com/Londopy/nexium-discord, 0.1.0)"
+const USER_AGENT: []u8 = "DiscordBot (https://github.com/Londopy/nexium-discord, 0.2.0)"
 
 /// What a REST call answered: its status and its body (JSON, as a rule).
 pub struct Answer {
@@ -76,9 +77,17 @@ pub struct Bot(T){
     timeout_ms: i64 = 15000
 }
 
-/// TLS layers for a bot, over the system's trusted roots.
+/// TLS layers for a bot: nxtls over the system's trusted roots, or the
+/// platform's TLS where the system has no bundle of them (Windows, unless
+/// `$SSL_CERT_FILE` names one).
 pub fn layers() -> !layer.Layers {
     return layer.layers()
+}
+
+/// TLS layers for a bot over the platform's own TLS: SChannel on Windows,
+/// Security.framework on macOS, OpenSSL's libssl elsewhere.
+pub fn system_layers() -> layer.Layers {
+    return layer.system_layers()
 }
 
 /// A bot with the token in `$DISCORD_TOKEN`, over `tls`; it connects at

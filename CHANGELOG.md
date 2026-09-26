@@ -6,6 +6,25 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-26
+
+### Added
+
+- Windows. nxtls 0.5.0 reads its randomness from Nexium 1.4's
+  `random.secure`, and where the system keeps no bundle of trusted roots
+  for nxtls to read (Windows, unless `$SSL_CERT_FILE` names one),
+  `discord.layers()` gives the platform's own TLS instead: `std.http`'s
+  `SystemTls`, SChannel on Windows, which checks certificates against the
+  system's store. Checked live on Windows through both.
+- `discord.system_layers()`: layers over the platform's TLS on any system
+  (SChannel, Security.framework, OpenSSL's libssl).
+
+### Changed
+
+- Needs Nexium 1.4.0, the release; CI runs on it, on Linux, Windows and
+  macOS, where it built a commit of Nexium's main branch before.
+- nxtls 0.5.0, from 0.4.0.
+
 ## [0.1.0] - 2026-09-25
 
 ### Added
